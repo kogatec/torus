@@ -1,0 +1,24 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+
+# Keypairs / secrets — never commit
+*.pem
+**/id.json
+**/*-keypair.json
+.env
+.env.*
+demo/.state/
+demo/video/*.ansi
+demo/video/*.aiff
+demo/video/*.mp4
+demo/video/*.png
+demo/video/min.json
+demo/video/durations.json
+demo/video/render/out/
+demo/video/render/frames.json
+demo/video/render/list.txt

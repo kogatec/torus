@@ -1,0 +1,25 @@
+[package]
+name = "torus-hook"
+version = "0.1.0"
+description = "Torus Token-2022 transfer-hook: enforce policy and accrue transfer volume on every transfer, at the token-program layer"
+edition = "2021"
+license = "UNLICENSED"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "torus_hook"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.2"
+anchor-spl = { version = "0.31.2", features = ["token_2022"] }
+# Match the transfer-hook / tlv versions used by spl-token-2022 6.x (as used by anchor-spl 0.31.2).
+spl-tlv-account-resolution = "0.9.0"
+spl-transfer-hook-interface = "0.9.0"

@@ -1,0 +1,26 @@
+[package]
+name = "torus-protocol"
+version = "0.1.0"
+description = "Torus core: issuance, manifest, commit, budget provisioning, atomic audit (Y+Delta), tiering, bankruptcy-remote USDC escrow"
+edition = "2021"
+license = "UNLICENSED"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "torus_protocol"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.2", features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.2", features = ["token_2022", "token_2022_extensions"] }
+# NOTE: the core program does not implement the transfer hook, so it has no direct dependency on
+#   spl-token-2022 / spl-transfer-hook-interface / spl-tlv-account-resolution (avoids version conflicts).
+#   Mint extension checks use the re-exports, e.g.
+#   `anchor_spl::token_2022::spl_token_2022::extension::StateWithExtensions`.

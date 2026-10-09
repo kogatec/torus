@@ -1,0 +1,56 @@
+//! Instruction handlers. Each file exposes
+//! `#[derive(Accounts)] pub struct <Ctx>` and `pub fn handler(...) -> Result<()>`.
+
+pub mod initialize;
+pub mod issue_token;
+pub mod set_manifest;
+pub mod provision_budget;
+pub mod commit_performance;
+pub mod designate_sample;
+pub mod record_verification;
+pub mod verify_disclosure;
+pub mod finalize_audit;
+pub mod deposit_pool;
+pub mod harvest_fees;
+pub mod payout;
+pub mod register_auditor;
+pub mod declare_default;
+pub mod set_issuer_terms;
+pub mod register_partner;
+pub mod convert_fees;
+pub mod claim_distribution;
+pub mod replace_auditor;
+pub mod request_exit;
+pub mod finalize_exit;
+pub mod verify_uniqueness;
+pub mod attest_leaf;
+pub mod start_liquidation;
+pub mod claim_liquidation;
+pub mod revoke_auditor;
+
+pub use initialize::*;
+pub use issue_token::*;
+pub use set_manifest::*;
+pub use provision_budget::*;
+pub use commit_performance::*;
+pub use designate_sample::*;
+pub use record_verification::*;
+pub use verify_disclosure::*;
+pub use finalize_audit::*;
+pub use deposit_pool::*;
+pub use harvest_fees::*;
+pub use payout::*;
+pub use register_auditor::*;
+pub use declare_default::*;
+pub use set_issuer_terms::*;
+pub use register_partner::*;
+pub use convert_fees::*;
+pub use claim_distribution::*;
+pub use replace_auditor::*;
+pub use request_exit::*;
+pub use finalize_exit::*;
+pub use verify_uniqueness::*;
+pub use attest_leaf::*;
+pub use start_liquidation::*;
+pub use claim_liquidation::*;
+pub use revoke_auditor::*;
