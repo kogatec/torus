@@ -39,9 +39,12 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
     let obligation = audit.obligation;
     require!(obligation > 0, TorusError::BudgetNotProvisioned);
 
-    // ================= (Y) Completeness: understatement (attack Y) =================
-    // A shortfall within the shortfall tolerance (bps) is allowed; falling further below the obligation is understatement.
-    // The threshold is the commit snapshot (cannot be loosened after observations are known).
+    // ================= (Y) Completeness: control total vs. obligation =================
+    // The control total is bound to the committed ledger (sum-bound tree, uniqueness verified), so it is exactly what
+    // the issuer stands behind. A shortfall is not hidden and not slashed: the gap is carried into the next obligation
+    // (TokenState.unfulfilled), so under-reporting never makes an obligation disappear. Within the shortfall
+    // tolerance (bps) it is an honest shortfall; beyond it the issuer also drops one tier. The threshold is the commit
+    // snapshot (cannot be loosened after observations are known).
     let lcl_amount = mul_bps(obligation, audit.shortfall_tolerance_bps)?;
     let understatement_floor = obligation.saturating_sub(lcl_amount);
     let is_understatement = audit.control_total < understatement_floor;
@@ -60,12 +63,12 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
     let is_overstatement = residual_breach || defect_breach;
 
     // ================= Result =================
-    // Any fraud: slash and drop to the base tier at once.
-    // No fraud and obligation met = pass; below it but within the band = honest shortfall.
+    // Overstatement (fraud): slash and drop to the base tier at once.
+    // Otherwise: obligation met = pass; below it within the band = honest shortfall; further below = under-delivered.
     let result: AuditResult = if is_overstatement {
         AuditResult::FraudOverstatement
     } else if is_understatement {
-        AuditResult::FraudUnderstatement
+        AuditResult::Underdelivered
     } else if audit.control_total >= obligation {
         AuditResult::Pass
     } else {
@@ -86,6 +89,11 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
         }
         AuditResult::HonestShortfall => {
             // No promotion: only the streak resets (tier unchanged, nothing slashed).
+            token_state.consecutive_passes = 0;
+        }
+        AuditResult::Underdelivered => {
+            // Honest but beyond the band: one tier down, streak reset, nothing slashed, not frozen.
+            token_state.tier = token_state.tier.saturating_sub(1);
             token_state.consecutive_passes = 0;
         }
         AuditResult::FraudOverstatement | AuditResult::FraudUnderstatement => {
@@ -165,12 +173,16 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
         token_state.reserved = token_state.reserved.saturating_sub(obligation);
         audit.reserved_remaining = 0;
     } else {
-        // Clean result: this cycle's reservation becomes min(obligation, control total). The part of the obligation the
-        // control total does not reach (honest shortfall) cannot be claimed by anyone, so it is released.
+        // No fraud: this cycle's reservation becomes min(obligation, control total). The part of the obligation the
+        // control total does not reach cannot be claimed in this cycle, so it is released here and carried into the
+        // next period's obligation instead (the funds stay in the redemption pool).
         audit.reserved_remaining = obligation.min(audit.control_total);
-        token_state.reserved = token_state
-            .reserved
-            .saturating_sub(obligation - audit.reserved_remaining);
+        let gap = obligation - audit.reserved_remaining;
+        token_state.reserved = token_state.reserved.saturating_sub(gap);
+        token_state.unfulfilled = token_state
+            .unfulfilled
+            .checked_add(gap)
+            .ok_or(TorusError::MathOverflow)?;
         // Issuer share: what waited for this audit becomes claimable.
         token_state.issuer_claimable = token_state
             .issuer_claimable

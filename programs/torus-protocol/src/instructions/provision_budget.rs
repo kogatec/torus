@@ -150,8 +150,11 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     }
     token_state.last_settled_harvested = token_state.cumulative_harvested;
 
-    // Budget = activity of the closed period × the fixed return rate.
-    let budget = mul_bps(delta, return_rate_bps)?;
+    // Budget = activity of the closed period × the fixed return rate, plus what earlier cycles fell short of
+    // (carried, so an honest shortfall is delivered later instead of disappearing).
+    let budget = mul_bps(delta, return_rate_bps)?
+        .checked_add(token_state.unfulfilled)
+        .ok_or(TorusError::MathOverflow)?;
     // **Pre-funding**: the redemption pool must hold the unpaid obligations (reserved) plus the new budget.
     // Without counting what is still unpaid, the same funds would be counted for two periods' obligations.
     let required = token_state
@@ -161,6 +164,7 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     require!(vault_amount >= required, TorusError::BudgetNotEscrowed);
     token_state.budget = budget;
     token_state.reserved = required;
+    token_state.unfulfilled = 0; // now part of this cycle's obligation
 
     // Issuer share: what accrued during the closed period waits for this cycle's audit (of that period's obligation).
     token_state.issuer_pending = token_state

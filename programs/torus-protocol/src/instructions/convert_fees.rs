@@ -74,6 +74,7 @@ pub fn handler<'info>(
     let required = ts
         .reserved
         .checked_add(accrued_budget)
+        .and_then(|r| r.checked_add(if ts.exited { 0 } else { ts.unfulfilled }))
         .ok_or(TorusError::MathOverflow)?;
 
     let bond_balance = ctx.accounts.slashing_bond.amount;

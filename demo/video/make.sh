@@ -15,7 +15,7 @@ durs = []
 for i, t in enumerate(n['segments']):
     subprocess.run(['say', '-v', n['voice'], '-r', str(n['rate']), '-o', f'seg{i}.aiff', t.replace('Törus', 'Torus')], check=True)
     d = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f'seg{i}.aiff'], capture_output=True, text=True).stdout)
-    durs.append(int(d * 1000) + 900)
+    durs.append(int(d * 1000) + 500)
 json.dump({'min': durs}, open('min.json', 'w'))
 PY
 python3 render/prepare.py capture.ansi min.json render/frames.json
@@ -37,6 +37,6 @@ filt.append(''.join(f'[a{i}]' for i in range(len(d['starts']))) + f'amix=inputs=
 subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', 'render/list.txt'] + inputs + [
     '-filter_complex', ';'.join(filt), '-map', '0:v', '-map', '[aout]', '-vf', 'fps=30,format=yuv420p',
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-b:a', '160k',
-    '-t', f"{d['end'] / 1000 + 1.0:.2f}", '-movflags', '+faststart', 'torus-demo.mp4'], check=True)
+    '-t', f"{d['end'] / 1000 + 0.5:.2f}", '-movflags', '+faststart', 'torus-demo.mp4'], check=True)
 PY
 echo "wrote demo/video/torus-demo.mp4"

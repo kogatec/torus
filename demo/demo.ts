@@ -121,7 +121,7 @@ const MERCHANTS = [
   "Hikari Delivery",
 ];
 const LEDGER = [180, 95, 140, 60, 210, 75, 130, 110]; // = 1,000 USDC (meets the obligation)
-const LEDGER_HONEST = [170, 90, 130, 55, 200, 70, 125, 110]; // = 950 USDC (honestly short, within the band)
+const LEDGER_HONEST = [150, 80, 110, 50, 170, 60, 100, 80]; // = 800 USDC (honestly short, beyond the 10% band)
 
 // ============================================================================
 // Output helpers
@@ -756,6 +756,7 @@ const RESULT: Record<number, string> = {
   2: "FRAUD (claimed more than was delivered)",
   3: "FRAUD (under-reported / defaulted)",
   4: "HONEST SHORTFALL",
+  5: "UNDER-DELIVERED (honest: not slashed)",
 };
 
 /** Launch a brand token with the bond and pool pre-funded by a deposit, and close one traded period. */
@@ -1024,7 +1025,7 @@ async function scene5() {
 }
 
 async function scene6() {
-  await scene(6, "Honest shortfalls are not slashed", "Falling slightly short and saying so costs progress, not the bond — only lies get slashed.");
+  await scene(6, "Honest shortfalls are not slashed", "Saying you fell short costs progress, not the bond, and the gap is still owed: only lies get slashed.");
   const { mint, periodId, budget } = await quickLaunch("DELTA");
 
   const total = LEDGER_HONEST.reduce((x, y) => x + y, 0);
@@ -1036,14 +1037,21 @@ async function scene6() {
   await ok("All sampled payments confirmed · 0 defects");
 
   const bondBefore = await bal(pdas.slashingBond(mint)[0]);
+  const tierBefore = (await tokenState(mint)).tier;
   await step("Anyone finalizes the audit");
   await finalize(mint, periodId);
   const a = await auditOf(mint, periodId);
   const ts = await tokenState(mint);
   await alert(`Result: ${yellow(RESULT[a.result])}`);
   await ok(`Bond untouched: ${usdc(await bal(pdas.slashingBond(mint)[0]))} (was ${usdc(bondBefore)}) · token frozen: ${ts.frozen}`);
-  await ok(`Progress toward a better tier resets (consecutive passes: ${ts.consecutivePasses})`);
-  await info(`A shortfall within the ${LCL_BPS / 100}% band is honest; claiming more than was delivered is what gets slashed.`);
+  await ok(`Tier ${tierBefore} → ${ts.tier} (one step down; already at the base tier here) · progress resets`);
+  const carried = BigInt(ts.unfulfilled.toString());
+  await alert(`The missing ${usdc(carried)} is carried into the next obligation`);
+
+  await step("The next period closes");
+  const p = await provisionUntilBudget(mint);
+  await ok(`Next obligation ${usdc(p.budget)}: the carried ${usdc(carried)} is owed again, on top of any new volume`);
+  await info("Under-reporting never makes an obligation disappear; claiming more than was delivered is what gets slashed.");
 }
 
 async function finale(ran: number[]) {
@@ -1059,7 +1067,7 @@ async function finale(ran: number[]) {
     [3, "Promise kept (sampled, observed)", green("PASS → merchants paid, only them, once")],
     [4, "Inflated claim", red("FRAUD → bond slashed, trading frozen")],
     [5, "Double-counting / skipping / silence", red("rejected, or slashed after the deadline")],
-    [6, "Honest shortfall (within the band)", yellow("no slash → loses tier progress")],
+    [6, "Honest shortfall", yellow("no slash → gap carried, tier progress lost")],
   ];
   for (const [n, what, outcome] of rows) if (ran.includes(n)) await line(`  ${what.padEnd(50)} ${outcome}`, PACE_MS / 2);
   console.log("");

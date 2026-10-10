@@ -4,7 +4,7 @@
  * Scenarios (each on its own mint, so a freeze does not spill over):
  *   (a) honest pass         → result = Pass, nothing slashed
  *   (b) attack X (overstatement) → observed ≪ claimed → FraudOverstatement, tier → 0, frozen, bond slashed
- *   (c) attack Y (understatement) → control_total < obligation − band → FraudUnderstatement, tier → 0, slashed
+ *   (c) under-delivery → control_total < obligation − band → Underdelivered: not slashed, one tier down, gap carried
  *   (d) a mint without the mechanism → rejected by issue_token
  *   (e) payout fails before finalization and for a fraudulent audit
  *   (f) self-transfers are not counted as volume (but count for the fee cross-check)
@@ -771,12 +771,23 @@ describe("torus-protocol lifecycle", () => {
     frozenPeriodId = periodId;
   });
 
-  it("(c) attack Y (understatement) → FraudUnderstatement, base tier, bond slashed", async () => {
+  it("(c) under-delivery beyond the band is not slashed: one tier down, the gap is carried into the next obligation", async () => {
     const mint = await setupToken();
-    const { audit, tsAfter, slashed, bondBefore } = await runOneCycle(mint, "attackY");
-    assert.equal(audit.result, 3, "AuditResult::FraudUnderstatement");
-    assert.equal(tsAfter.frozen, true, "frozen");
-    assert.equal(slashed, bondBefore, "the whole bond goes to the slash destination");
+    const { audit, tsAfter, slashed, budget } = await runOneCycle(mint, "attackY");
+    assert.equal(audit.result, 5, "AuditResult::Underdelivered");
+    assert.equal(tsAfter.frozen, false, "not frozen");
+    assert.equal(slashed, 0, "nothing slashed");
+    const gap = budget - (audit.controlTotal as BN).toNumber();
+    assert.isAbove(gap, 0, "the ledger was short of the obligation");
+    assert.equal((tsAfter.unfulfilled as BN).toNumber(), gap, "the gap is carried");
+
+    // The next obligation includes the carried gap (the period's own volume × rate, plus the gap).
+    await depositTx(mint, OBLIGATION);
+    const next = await accrueAndProvision(mint);
+    const ts: any = await tokenState(mint);
+    const own = ((ts.priorPeriodActivity as BN).toNumber() * RETURN_RATE_BPS) / BPS;
+    assert.equal(next.budget, own + gap, "next obligation = own volume × rate + carried gap");
+    assert.equal((ts.unfulfilled as BN).toNumber(), 0, "the carry moved into the obligation");
   });
 
   it("(d) issue_token rejects a mint without the Torus mechanism", async () => {

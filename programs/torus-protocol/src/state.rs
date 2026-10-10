@@ -144,6 +144,11 @@ pub struct TokenState {
     pub liquidation_pool: u64,
     /// period_id of the audit cycle used as the basis of the split.
     pub liquidation_ref_period: u64,
+
+    // ---- Honest shortfalls are carried, not slashed ----
+    /// Obligation the issuer committed to less than (obligation − control total of finalized cycles without fraud).
+    /// Added to the next period's budget, so under-reporting never makes an obligation disappear.
+    pub unfulfilled: u64,
 }
 
 /// Judging rules, fixed before the ledger is built.

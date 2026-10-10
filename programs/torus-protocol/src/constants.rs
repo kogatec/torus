@@ -103,9 +103,12 @@ pub enum AuditResult {
     Pass = 1,
     /// Attack X (overstatement, fabricated entries), detected by the deviation check (Δ).
     FraudOverstatement = 2,
-    /// Attack Y (understatement, thinning the population), detected by the completeness check (Y).
-    /// Also used for a default (missing disclosure or uniqueness proof by the deadline).
+    /// Default: the commitment, the sampled disclosures or the uniqueness proof were missing at the deadline
+    /// (declare_default). Treated like fraud.
     FraudUnderstatement = 3,
-    /// Honest shortfall within the tolerance band. Progress resets, nothing is slashed.
+    /// Honest shortfall within the tolerance band. Progress resets, nothing is slashed; the gap is carried.
     HonestShortfall = 4,
+    /// Honest under-delivery beyond the tolerance band (the ledger is sum-bound and unique, so this is what was
+    /// actually delivered). Not slashed: the tier drops one step and the gap is carried into the next obligation.
+    Underdelivered = 5,
 }

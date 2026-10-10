@@ -7,7 +7,7 @@ A company issues a token and promises to give part of its trading activity back 
 - the obligation is **computed on-chain from trading volume**, not reported by the company;
 - the money to pay it is **collected from every transfer into accounts the company cannot touch**;
 - the company's claim that it delivered is **committed, checked for double counting, sampled at random and checked against an independent record**;
-- a false claim, a refusal to disclose, or silence **slashes the company's bond automatically**, while an honest small shortfall does not.
+- a false claim, a refusal to disclose, or silence **slashes the company's bond automatically**, while an honest shortfall is never slashed: the missing amount is carried into the next obligation.
 
 > **Status:** hackathon prototype, unaudited. Patent pending (Japan, filed October 2026). See [Limitations](#limitations).
 
@@ -33,7 +33,7 @@ A company issues a token and promises to give part of its trading activity back 
  audit cycle ─► commit Merkle-sum root of the ledger ─► verify uniqueness of every entry
              ─► random sample after the commit ─► on-chain disclosure proofs
              ─► independent auditor records each sampled payment
-             ─► finalize in one instruction: understatement check, defect count,
+             ─► finalize in one instruction: shortfall check (gap carried), defect count,
                 tier update, slash or release
              ─► merchants claim their own entries (only the committed recipient, once,
                 up to the amount the auditor confirmed)
@@ -56,7 +56,7 @@ Periods start at the first close after the bond is full and run on a fixed grid.
 | Sample | `designate_sample` | Indices drawn from randomness fixed after the commit slot. |
 | Disclose | `verify_disclosure` | A proof per sampled leaf, bound to (index, population size), so no hidden leaves can inflate the total. |
 | Observe | `record_verification` | The registered auditor records the observed amount for each sampled payment; the program counts defects and sums. |
-| Finalize | `finalize_audit` | One atomic step: understatement check, overstatement check (residual and defect count), tier update, then either release (company escrow becomes claimable) or slash (bond and escrow to the compensation pool, token frozen). |
+| Finalize | `finalize_audit` | One atomic step: shortfall check, overstatement check (residual and defect count), tier update, then either release (company escrow becomes claimable) or slash (bond and escrow to the compensation pool, token frozen). A shortfall is not slashed: the gap is carried into the next period's obligation, and a shortfall beyond the band (10% in the demo) also costs one tier. |
 | Pay | `payout`, `attest_leaf` | Anyone can submit a claim, but funds go only to the recipient committed in the leaf, once, up to the confirmed amount: the observed value for sampled leaves, or the auditor's per-leaf confirmation for the others. |
 
 `declare_default` lets anyone settle a cycle whose disclosure or uniqueness check was not completed by the deadline: it is treated like fraud. A late auditor can be replaced by the operator (`replace_auditor`); a revoked auditor (`revoke_auditor`) can no longer record, confirm, or be named for a new cycle.
@@ -102,12 +102,12 @@ demo/run.sh          # narrated demo on a fresh local validator (--step, --fast,
 8. **Fixed periods.** Periods are counted on a fixed grid; delaying a close cannot change their length or which volume they contain.
 9. **Bond first.** The operator's share is never counted as bond; the company's share fills the bond before anything else, and nothing is metered until the bond is full.
 10. **Continuity.** A period cannot close until the previous audit is final; missing disclosures or uniqueness proofs become a default after the deadline.
+11. **Obligations do not disappear.** An honest shortfall is not slashed, but the gap is added to the next period's obligation (and must be funded before that period can close).
 
 ## Limitations
 
 - **Randomness:** the sample is drawn from entropy the operator supplies after the commit. Production needs a VRF (e.g. Switchboard, ORAO) so that no one can choose it.
 - **Observation:** the auditor's observed amounts are entered by the auditor. Connecting payment processors' signed records is the next step.
-- **Honest shortfall band:** a shortfall within the configured band (10% in the demo) is not slashed; a larger under-report is currently treated as understatement.
 - **Not implemented yet:** a provisional/dispute window before finality, statistical lower bounds per recipient (payouts currently require per-leaf confirmation), auditor bonds, and binding payment IDs to the issuer with external signatures (today the used-ID registry is per token).
 - **Legal:** program-owned accounts keep the funds away from the company's keys. Whether that makes them bankruptcy-remote is a legal question that depends on jurisdiction and contracts.
 - **Unaudited code.** Do not use with real funds.

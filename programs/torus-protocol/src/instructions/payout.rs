@@ -9,7 +9,7 @@
 //!
 //! [Gates]
 //!   - audit.stage == Finalized                      … no payout before finalization
-//!   - audit.result ∈ {Pass, HonestShortfall}        … no payout once fraud is established
+//!   - audit.result ∈ {Pass, HonestShortfall, Underdelivered} … no payout once fraud or default is established
 //!   - (after a freeze, recipients of audits finalized without fraud can still claim: a freeze stops new
 //!     business, it does not cancel third parties' finalized rights)
 //!   - token_state.redemption_started                … no redemptions before the bond is full
@@ -75,10 +75,11 @@ pub fn handler(
     );
 
     // --- (2) No fraud (Pass or honest shortfall only) ---
-    // Pending / FraudOverstatement / FraudUnderstatement cannot be paid.
+    // Pending / FraudOverstatement / FraudUnderstatement (default) cannot be paid.
     require!(
         audit.result == AuditResult::Pass as u8
-            || audit.result == AuditResult::HonestShortfall as u8,
+            || audit.result == AuditResult::HonestShortfall as u8
+            || audit.result == AuditResult::Underdelivered as u8,
         TorusError::Unauthorized
     );
 
