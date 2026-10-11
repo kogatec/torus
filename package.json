@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Torus — verifiable redemption token protocol on Solana (Token-2022 transfer fee + transfer hook). Fees fund a program-owned USDC pool (bond first); redemptions are paid only on audited, uniqueness-checked commitments, with over- and under-statement checked in one atomic step.",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "scripts": {
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check",

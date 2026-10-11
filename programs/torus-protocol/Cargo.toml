@@ -3,7 +3,7 @@ name = "torus-protocol"
 version = "0.1.0"
 description = "Torus core: issuance, manifest, commit, budget provisioning, atomic audit (Y+Delta), tiering, bankruptcy-remote USDC escrow"
 edition = "2021"
-license = "UNLICENSED"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "lib"]

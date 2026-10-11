@@ -114,4 +114,8 @@ demo/run.sh          # narrated demo on a fresh local validator (--step, --fast,
 
 ## License
 
-Copyright © 2026 kogatec. All rights reserved. Patent pending (Japan). The license for this code has not been decided yet; until then, no license is granted beyond viewing and running it to evaluate this hackathon submission.
+Copyright 2026 kogatec. Licensed under the [Apache License, Version 2.0](LICENSE).
+
+This repository is the open core of Törus: the on-chain programs, the SDK, the tests and the demo. Off-chain components (issuer risk scoring, sampling design, auditor selection, related-party detection) are proprietary and not included.
+
+Patent pending (Japan). The patent license in Section 3 of the Apache License applies to this code; no other patent rights are granted.

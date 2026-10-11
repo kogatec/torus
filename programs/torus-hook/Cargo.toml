@@ -3,7 +3,7 @@ name = "torus-hook"
 version = "0.1.0"
 description = "Torus Token-2022 transfer-hook: enforce policy and accrue transfer volume on every transfer, at the token-program layer"
 edition = "2021"
-license = "UNLICENSED"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "lib"]
