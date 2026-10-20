@@ -1,0 +1,38 @@
+Törus — Review-Only License (All Rights Reserved)
+
+Copyright (c) 2026 Keiichirou Koga (GitHub: kogatec). All rights reserved.
+
+This repository is published so that the judges and organizers of the Colosseum
+hackathon, and other readers, can review the Törus submission. It is not open
+source.
+
+1. What you may do. You may view the source code on GitHub, and download and
+   run it on your own computer, on a local validator, or on Solana devnet,
+   solely to review and evaluate this project.
+
+2. What you may not do. Without the prior written permission of the copyright
+   holder, you may not copy the code (except as needed for the review in
+   section 1), modify it, merge it into other software, publish, distribute,
+   sublicense or sell it, deploy it to Solana mainnet or any other production
+   network, offer it as a service, or use it, in whole or in part, for any
+   other purpose, including building a product that works the same way.
+
+3. No patent license. The mechanisms implemented in this code are the subject
+   of patent applications (patent pending in Japan). No license or other right
+   under any patent or patent application is granted to you, expressly or by
+   implication, estoppel or otherwise. Running the code for review under
+   section 1 does not give you any right to practice those mechanisms.
+
+4. No trademark license. This license does not grant any right to use the name
+   "Törus" or any logo of the copyright holder.
+
+5. Forks on GitHub. Forking this repository on GitHub, as GitHub's Terms of
+   Service allow for public repositories, does not grant any right beyond
+   section 1.
+
+6. No warranty. THE CODE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE CODE OR ITS USE.
+
+For any other use, including commercial licensing, contact the copyright holder
+through https://github.com/kogatec.

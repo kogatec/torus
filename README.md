@@ -114,4 +114,6 @@ demo/run.sh          # narrated demo on a fresh local validator (--step, --fast,
 
 ## License
 
-Copyright © 2026 kogatec. All rights reserved. Patent pending (Japan). The license for this code has not been decided yet; until then, no license is granted beyond viewing and running it to evaluate this hackathon submission.
+Copyright © 2026 Keiichirou Koga (kogatec). All rights reserved. Patent pending (Japan).
+
+This code is published for review only. You may view it, and run it locally or on devnet, to evaluate this hackathon submission. Any other use, including copying, modifying, redistributing, deploying to mainnet or building a product that works the same way, requires written permission. No patent license is granted, expressly or by implication. See [LICENSE](LICENSE).
