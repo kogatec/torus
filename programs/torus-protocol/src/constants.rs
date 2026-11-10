@@ -15,14 +15,21 @@ pub const PROMOTION_CONSECUTIVE_PASSES: u8 = 5;
 /// Each sampled leaf keeps its index, claimed value and observed value; 256 keeps the account under 10 KB.
 pub const MAX_SAMPLE_SIZE: usize = 256;
 
-/// Tier → distribution ratio (bps), indexed by tier.
-/// Higher tiers return a larger share of the converted fees to the issuer (an incentive to keep promises).
-pub const TIER_DISTRIBUTION_BPS: [u16; (MAX_TIER as usize) + 1] = [
-    2_000, // tier 0 (base): 20%
-    3_500, // tier 1: 35%
-    5_000, // tier 2: 50%
-    6_500, // tier 3: 65%
-];
+/// Number of tiers (ranks 0..=MAX_TIER). The issuer's share per rank is set per company by the operator
+/// (set_issuer_terms); only the rule "a higher rank never gets less" is fixed in code.
+pub const TIERS: usize = MAX_TIER as usize + 1;
+
+/// Steps of the hold perk rate (e.g. 30% → 20% → 10% every two months, then 0%).
+pub const HOLD_STEPS: usize = 3;
+
+/// Kinds of perk redemption (redeem_perk).
+pub const PERK_TRADER: u8 = 0;
+pub const PERK_HOLD: u8 = 1;
+
+/// Highest ask a company may allow for listed trader perks (bps of the face value): customers keep at least 10%.
+pub const MAX_ASK_LIMIT_BPS: u16 = 9_000;
+/// Highest share of a bill that listed trader perks may pay (bps): at least half must be a real purchase.
+pub const USAGE_CAP_LIMIT_BPS: u16 = 5_000;
 
 // ---- PDA seeds ----
 pub const CONFIG_SEED: &[u8] = b"config";
@@ -51,6 +58,28 @@ pub const OUTCOME_SEED: &[u8] = b"outcome";
 pub const ATTEST_SEED: &[u8] = b"attest";
 /// Liquidation claim record (audit cycle × leaf index).
 pub const LIQUIDATION_SEED: &[u8] = b"liq";
+/// Withdrawal request from the issuer escrow (seeds = [withdrawal, mint, invoice_hash]; one per invoice).
+pub const WITHDRAWAL_SEED: &[u8] = b"withdrawal";
+/// The company's tax accountant (one per token; registered by the operator with the accountant's signature).
+pub const TAX_ACCOUNTANT_SEED: &[u8] = b"tax_accountant";
+/// The tax accountant's report for a cycle (seeds = [tax_report, mint, period_id]).
+pub const TAX_REPORT_SEED: &[u8] = b"tax_report";
+/// Registry of local partners (kept by the operator; one record per partner key).
+pub const LOCAL_PARTNER_SEED: &[u8] = b"local_partner";
+/// Perk terms of a token (set by the operator).
+pub const PERK_TERMS_SEED: &[u8] = b"perk_terms";
+/// Perk budget of a period (seeds = [perk_period, mint, period_id]).
+pub const PERK_PERIOD_SEED: &[u8] = b"perk_period";
+/// Merchants registered by the issuer (seeds = [merchant, mint, merchant]).
+pub const MERCHANT_SEED: &[u8] = b"merchant";
+/// Perk usage of a registered holder account in the current period (seeds = [holder_perk, token account]).
+pub const HOLDER_PERK_SEED: &[u8] = b"holder_perk";
+/// Receipt of a perk redemption (seeds = [perk, mint, receipt_id]; one per receipt, so it is recorded once).
+pub const PERK_RECEIPT_SEED: &[u8] = b"perk";
+/// Trader perks a seller set aside for customers in a period (seeds = [perk_lot, mint, period_id, token account]).
+pub const PERK_LOT_SEED: &[u8] = b"perk_lot";
+/// Seed of the transfer hook's per-account record (HolderRecord, owned by torus-hook).
+pub const HOLDER_SEED: &[u8] = b"holder";
 /// Maximum number of subtrees kept while verifying uniqueness (supports up to 2^32 leaves).
 pub const MAX_UNIQ_STACK: usize = 33;
 
@@ -63,10 +92,14 @@ pub const MAX_SHORTFALL_TOLERANCE_BPS: u16 = 2_000;
 /// Upper bound on the allowed defect count, as a share of the sample size (bps): 20%.
 pub const MAX_DEFECT_RATE_BPS: u64 = 2_000;
 
-/// On a voluntary exit, the share of the remaining bond returned to the issuer (bps); the rest goes to the
-/// operator treasury (Config.treasury). On a forced exit for a violation (fraud, refusal to disclose,
-/// missing commitment) the whole bond is slashed (finalize_audit / declare_default).
+/// On a voluntary exit, the issuer's share of the remaining bond (bps), which goes to its customers (the redemption
+/// pool, split in liquidation); the rest goes to the operator treasury (Config.treasury). On a forced exit for a
+/// violation (fraud, refusal to disclose, missing commitment) the whole bond is slashed (finalize_audit / declare_default).
 pub const EXIT_ISSUER_SHARE_BPS: u16 = 5_000;
+
+/// Share of the bond target the issuer may spend from the bond through approved requests (bps): half. A payment
+/// from the bond must leave at least the rest of the target in it; the issuer's share of later fees refills it first.
+pub const BOND_USE_MAX_BPS: u64 = 5_000;
 
 /// Maximum depth of a disclosure proof (Merkle sum tree). Supports up to 2^32 elements.
 pub const MAX_PROOF_DEPTH: usize = 32;
@@ -105,10 +138,14 @@ pub enum AuditResult {
     FraudOverstatement = 2,
     /// Default: the commitment, the sampled disclosures or the uniqueness proof were missing at the deadline
     /// (declare_default). Treated like fraud.
+    /// Also when no tax report came by the deadline (finalize_audit).
     FraudUnderstatement = 3,
     /// Honest shortfall within the tolerance band. Progress resets, nothing is slashed; the gap is carried.
     HonestShortfall = 4,
     /// Honest under-delivery beyond the tolerance band (the ledger is sum-bound and unique, so this is what was
     /// actually delivered). Not slashed: the tier drops one step and the gap is carried into the next obligation.
     Underdelivered = 5,
+    /// The declared total exceeded the tax accountant's book total and no reconciled report came within the hold.
+    /// Forfeited like fraud.
+    BookMismatch = 6,
 }

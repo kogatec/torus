@@ -15,6 +15,7 @@
 //!   - token_state.redemption_started                … no redemptions before the bond is full
 //!   - the leaf is confirmed                         … sampled leaves up to the observed value, others up to the
 //!                                                     auditor's confirmation (attest_leaf); unconfirmed leaves are not paid
+//!   - a cycle capped by the books                   … each leaf gets its share of the book total (tax_rules::recognized_share)
 //!   - redemption_vault.amount >= amount             … no payout beyond the pool
 //!   - balance after payout >= reserved             … funds reserved for other periods stay untouched
 //!
@@ -35,6 +36,7 @@ use crate::constants::*;
 use crate::errors::TorusError;
 use crate::instructions::verify_disclosure::{fold_sum_proof, SumSibling};
 use crate::state::{AuditCycle, ClaimRecord, Config, LeafAttestation, TokenState};
+use crate::tax_rules;
 
 /// Confirmed amount of a leaf: the observed value for a sampled leaf, otherwise the auditor's confirmation.
 /// LeafNotConfirmed if neither exists. Payouts and liquidation pay at most this (and at most the leaf's value).
@@ -111,6 +113,8 @@ pub fn handler(
         ctx.accounts.attestation.as_ref().map(|a| &***a),
     )?;
     let amount = value.min(confirmed);
+    // Scaled down to the book total when the tax reconciliation capped the cycle.
+    let amount = tax_rules::recognized_share(amount, audit.recognized_total, audit.control_total);
     require!(amount > 0, TorusError::NothingToPay);
 
     // --- (7) The redemption pool holds enough ---

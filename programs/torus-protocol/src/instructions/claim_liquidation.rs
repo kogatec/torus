@@ -3,7 +3,8 @@
 //! The liquidation pool (the surplus fixed by start_liquidation) is split over the leaves of the basis audit (the
 //! last one finalized without fraud), pro rata to each leaf's confirmed amount (observed value or the auditor's
 //! confirmation, at most the leaf's value):  share = pool × confirmed ÷ control total
-//! Once per leaf (LiquidationClaim is created). Shares of unconfirmed leaves stay in the pool.
+//! The pool grows when issuer shares arrive after an exit, so each claim pays the leaf's share of the pool so far minus
+//! what it already received (LiquidationClaim keeps the total). Shares of unconfirmed leaves stay in the pool.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
@@ -53,14 +54,15 @@ pub fn handler(
         ctx.accounts.attestation.as_deref(),
     )?;
     let basis = value.min(confirmed);
-    let share = ((ts.liquidation_pool as u128) * (basis as u128) / (audit.control_total as u128)) as u64;
+    let entitled = ((ts.liquidation_pool as u128) * (basis as u128) / (audit.control_total as u128)) as u64;
+    let record = &mut ctx.accounts.liquidation_claim;
+    let share = entitled.saturating_sub(record.amount);
     require!(share > 0, TorusError::NothingToPay);
 
-    let record = &mut ctx.accounts.liquidation_claim;
     record.audit = audit_key;
     record.index = index;
     record.beneficiary = beneficiary;
-    record.amount = share;
+    record.amount = entitled;
     record.bump = ctx.bumps.liquidation_claim;
 
     let mint_key = ts.mint;
@@ -130,9 +132,9 @@ pub struct ClaimLiquidation<'info> {
     #[account(mut, token::mint = usdc_mint)]
     pub beneficiary_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Liquidation claim record (one per leaf).
+    /// Liquidation claim record (one per leaf; keeps the total paid to it).
     #[account(
-        init,
+        init_if_needed,
         payer = crank,
         space = 8 + LiquidationClaim::INIT_SPACE,
         seeds = [LIQUIDATION_SEED, audit.key().as_ref(), index.to_le_bytes().as_ref()],

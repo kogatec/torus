@@ -1,6 +1,8 @@
 //! provision_budget: closes a period and provisions its obligation.
 //!
-//! Derives the budget deterministically: the closed period's on-chain volume × the fixed return rate. The volume
+//! Derives the budget deterministically: the closed period's on-chain volume × the return rate in force when the period
+//! started (a later manifest does not change it). A period that started after the campaign ended (a gap before the next
+//! manifest) gets no obligation; the carried shortfall waits for the next campaign or the exit's final audit. The volume
 //! comes from the hook's VolumeCounter (cumulative, monotonic, owned by torus_hook), read here as raw bytes;
 //! the period's activity is the difference between the cumulative values at its two boundaries.
 //! Anyone can crank it (the signer only pays the transaction fee).
@@ -107,7 +109,10 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     // Read the hook's cumulative volume and cumulative expected fee (both monotonic).
     let (counter_total, fee_total) =
         read_volume_counter(&ctx.accounts.volume_counter.to_account_info())?;
-    let return_rate_bps = ctx.accounts.manifest.return_rate_bps;
+    // Terms of period k: those in force when it started (a manifest set later does not change them).
+    let period_start = period_end.checked_sub(period_len).ok_or(TorusError::MathOverflow)?;
+    let terms = ctx.accounts.manifest.terms_at(period_start);
+    let in_campaign = period_start <= terms.valid_until;
     // Read the redemption pool's actual balance first, to check the budget is covered.
     let vault_amount = ctx.accounts.redemption_vault.amount;
 
@@ -150,11 +155,21 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     }
     token_state.last_settled_harvested = token_state.cumulative_harvested;
 
-    // Budget = activity of the closed period × the fixed return rate, plus what earlier cycles fell short of
+    // Budget = activity of the closed period × the return rate of its terms, plus what earlier cycles fell short of
     // (carried, so an honest shortfall is delivered later instead of disappearing).
-    let budget = mul_bps(delta, return_rate_bps)?
-        .checked_add(token_state.unfulfilled)
-        .ok_or(TorusError::MathOverflow)?;
+    // A period that started between campaigns gets no new obligation (its volume is not counted) and the carry waits,
+    // except in the exit's last period, whose final audit settles the carry.
+    let settles_carry = in_campaign
+        || (token_state.exit_requested && k == token_state.exit_request_period);
+    let budget = if in_campaign {
+        mul_bps(delta, terms.return_rate_bps)?
+            .checked_add(token_state.unfulfilled)
+            .ok_or(TorusError::MathOverflow)?
+    } else if settles_carry {
+        token_state.unfulfilled
+    } else {
+        0
+    };
     // **Pre-funding**: the redemption pool must hold the unpaid obligations (reserved) plus the new budget.
     // Without counting what is still unpaid, the same funds would be counted for two periods' obligations.
     let required = token_state
@@ -164,7 +179,11 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     require!(vault_amount >= required, TorusError::BudgetNotEscrowed);
     token_state.budget = budget;
     token_state.reserved = required;
-    token_state.unfulfilled = 0; // now part of this cycle's obligation
+    if settles_carry {
+        token_state.unfulfilled = 0; // now part of this cycle's obligation
+    }
+    // The audit of this obligation is judged by the same terms (commit_performance snapshots them from here).
+    token_state.cycle_terms = terms;
 
     // Issuer share: what accrued during the closed period waits for this cycle's audit (of that period's obligation).
     token_state.issuer_pending = token_state

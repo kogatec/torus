@@ -1,7 +1,7 @@
 //! On-chain state accounts.
 
 use anchor_lang::prelude::*;
-use crate::constants::{MAX_SAMPLE_SIZE, MAX_UNIQ_STACK};
+use crate::constants::{HOLD_STEPS, MAX_SAMPLE_SIZE, MAX_UNIQ_STACK, TIERS};
 
 /// Protocol-wide configuration (singleton PDA).
 #[account]
@@ -23,6 +23,9 @@ pub struct Config {
     pub treasury: Pubkey,
     /// Minimum bond target (fixed at initialize). set_issuer_terms rejects anything lower.
     pub min_bond_target: u64,
+    /// How long a cycle waits for the tax accountant's reconciled report when the declared total exceeds the book
+    /// total (seconds). Fixed by the operator at initialize; no company can change it.
+    pub tax_hold_period: i64,
 }
 
 /// State of each issued token (issuer, tier, activity, pool accounts).
@@ -101,17 +104,18 @@ pub struct TokenState {
     //      the operator's fee is never counted as bond
     //   2. from the issuer's share: the bond first, up to bond_target (set per company by the operator)
     //   3. then the redemption pool, up to what is owed (reserved + the obligation now accruing)
-    //   4. the rest into the issuer escrow (claimable only after the audit finalizes)
+    //   4. the rest into the issuer escrow (released by a clean audit, spent only through approved withdrawal requests)
     // No issuer key is involved on any of these paths.
     /// Minimum conversion price: USDC base units per whole brand token (10^decimals units). Set by the operator.
     pub min_conversion_price: u64,
-    /// USDC account (PDA-owned) holding the issuer's share until the audit finalizes.
+    /// USDC account (PDA-owned) holding the issuer's share. It belongs to the issuer but the issuer cannot spend it freely:
+    /// a payment needs the approval of the escrow partner and of the auditor (approve_withdrawal).
     pub issuer_escrow: Pubkey,
     /// Issuer share accrued in the current period. Moves to issuer_pending at the next provision.
     pub issuer_accruing: u64,
     /// Issuer share waiting for the current audit. Released on a clean result, slashed on fraud or default.
     pub issuer_pending: u64,
-    /// Issuer share the issuer can claim (passed a clean audit).
+    /// Issuer share released by a clean audit. It stays in the escrow; withdrawal requests can spend up to this.
     pub issuer_claimable: u64,
     /// Part of the redemption pool owed for provisioned obligations and not paid yet. Kept aside before
     /// any new provision or issuer distribution.
@@ -140,7 +144,8 @@ pub struct TokenState {
     pub last_good_period: u64,
     /// Whether liquidation has started (after an exit or a freeze).
     pub liquidation_started: bool,
-    /// Amount distributed in liquidation (redemption pool balance at the start minus amounts still owed).
+    /// Amount distributed in liquidation (redemption pool balance at the start minus amounts still owed), plus the
+    /// issuer shares that arrive after the start (cumulative; each leaf is paid up to its share of this total).
     pub liquidation_pool: u64,
     /// period_id of the audit cycle used as the basis of the split.
     pub liquidation_ref_period: u64,
@@ -149,6 +154,27 @@ pub struct TokenState {
     /// Obligation the issuer committed to less than (obligation − control total of finalized cycles without fraud).
     /// Added to the next period's budget, so under-reporting never makes an obligation disappear.
     pub unfulfilled: u64,
+
+    // ---- Issuer escrow and the terms of the cycle being audited ----
+    /// Registered partner managing the issuer escrow (picked by the issuer; default = none).
+    pub escrow_partner: Pubkey,
+    /// Terms of the period whose obligation was last provisioned (those in force when it started). commit_performance
+    /// snapshots the judging parameters from here, so a later manifest cannot change how that period is judged.
+    pub cycle_terms: ManifestTerms,
+
+    // ---- Terms negotiated per company (set by the operator with set_issuer_terms) ----
+    /// The issuer's share of converted fees for ranks 0..=3 (bps). A higher rank never gets less.
+    /// distribution_ratio_bps is the entry of the current tier.
+    pub tier_share_bps: [u16; TIERS],
+    /// The company's local partner (operates restamps; takes its share of the operator's fee). Default = not set.
+    pub local_partner: Pubkey,
+}
+
+impl TokenState {
+    /// Index of the period containing `now` on the fixed grid (0 before metering starts), as the hook computes it.
+    pub fn grid_index(&self, now: i64) -> u64 {
+        torus_hook::grid_index(now, self.grid_start_ts, self.grid_period_len)
+    }
 }
 
 /// Judging rules, fixed before the ledger is built.
@@ -181,6 +207,47 @@ pub struct Manifest {
     /// overstatement. A count, not a ratio: comparing the defect ratio with the per-element tolerance lets
     /// defects through as the sample grows (29 samples at 5% tolerance: one defect = 3.4% passes).
     pub max_defects: u16,
+    /// When the terms above took effect (the last set_manifest). A period that started earlier keeps prev_terms.
+    pub valid_from: i64,
+    /// Terms in force before valid_from, for periods that started before the last change and are not closed yet.
+    pub prev_terms: ManifestTerms,
+    /// Hash of the use plan for the issuer escrow (the items and their caps are an off-chain document).
+    pub use_plan_hash: [u8; 32],
+}
+
+/// The terms of a manifest that decide a period's obligation and how its audit is judged.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace)]
+pub struct ManifestTerms {
+    pub return_rate_bps: u16,
+    pub tolerance_bps: u16,
+    pub shortfall_tolerance_bps: u16,
+    pub sample_size: u16,
+    pub max_defects: u16,
+    /// End of the campaign. A period that starts after it (a gap between campaigns) gets no obligation.
+    pub valid_until: i64,
+}
+
+impl Manifest {
+    /// The current terms.
+    pub fn terms(&self) -> ManifestTerms {
+        ManifestTerms {
+            return_rate_bps: self.return_rate_bps,
+            tolerance_bps: self.tolerance_bps,
+            shortfall_tolerance_bps: self.shortfall_tolerance_bps,
+            sample_size: self.sample_size,
+            max_defects: self.max_defects,
+            valid_until: self.valid_until,
+        }
+    }
+
+    /// Terms of a period that started at `start`: those in force at that time.
+    pub fn terms_at(&self, start: i64) -> ManifestTerms {
+        if start >= self.valid_from {
+            self.terms()
+        } else {
+            self.prev_terms
+        }
+    }
 }
 
 /// Audit cycle (commit → sample → verify → atomic finalization).
@@ -256,6 +323,12 @@ pub struct AuditCycle {
     /// Whether uniqueness has been verified (payment IDs strictly increasing over all leaves, root matching,
     /// every ID registered as used).
     pub uniqueness_verified: bool,
+    /// End of the hold set by finalize_audit when the declared total exceeded the tax accountant's book total
+    /// (0 = no hold). Payouts wait; a reconciled report within the hold resumes the cycle, none forfeits it.
+    pub tax_hold_until: i64,
+    /// Total recognized when the cycle was finalized without fraud: the control total, or the book total when the tax
+    /// reconciliation capped it. Each payout is scaled by it ÷ the control total (tax_rules::recognized_share).
+    pub recognized_total: u64,
 }
 
 /// Registered independent auditor (registered by the operator, Config.authority).
@@ -344,6 +417,206 @@ pub struct LiquidationClaim {
     pub audit: Pubkey,
     pub index: u32,
     pub beneficiary: Pubkey,
+    /// Total paid to this leaf so far (its share of the cumulative liquidation pool).
     pub amount: u64,
+    pub bump: u8,
+}
+
+/// The issuer's request to pay from its escrow (one per invoice hash: the address is derived from it).
+#[account]
+#[derive(InitSpace)]
+pub struct WithdrawalRequest {
+    pub token: Pubkey,
+    /// Use plan in force when the request was filed (Manifest.use_plan_hash).
+    pub plan_hash: [u8; 32],
+    /// Item of the use plan the payment falls under (the items and their caps are in the off-chain plan).
+    pub plan_item: u16,
+    pub amount: u64,
+    /// The payee's USDC account (not owned by the issuer).
+    pub payee: Pubkey,
+    pub invoice_hash: [u8; 32],
+    /// Key that approved as the escrow partner (default = not yet).
+    pub partner_approval: Pubkey,
+    /// Key that approved as the auditor (default = not yet).
+    pub auditor_approval: Pubkey,
+    pub executed: bool,
+    pub bump: u8,
+    /// Paid from the bond (second account) instead of the escrow. The bond may only go down to half of its target.
+    pub from_bond: bool,
+}
+
+/// The account at `ai` as T, if `owner` owns it and it holds data (for PDAs that may not exist yet).
+pub fn load_if_exists<T: AccountDeserialize>(ai: &AccountInfo, owner: &Pubkey) -> Result<Option<T>> {
+    if ai.owner != owner || ai.data_is_empty() {
+        return Ok(None);
+    }
+    let data = ai.try_borrow_data()?;
+    Ok(Some(T::try_deserialize(&mut &data[..])?))
+}
+
+// ============================ Tax accountant reconciliation ============================
+
+/// The company's tax accountant (or CPA), one per token. Registered by the operator; the accountant signs too,
+/// accepting that a false report is referred to the authority supervising its license.
+#[account]
+#[derive(InitSpace)]
+pub struct TaxAccountantRecord {
+    pub token: Pubkey,
+    pub accountant: Pubkey,
+    /// Hash of the signed consent (the warning and the release from confidentiality), kept off-chain.
+    pub consent_hash: [u8; 32],
+    pub active: bool,
+    pub bump: u8,
+}
+
+/// The tax accountant's report for a cycle: the total of the book's sub-account for Torus returns. The accountant
+/// never sees the company's declared figure.
+#[account]
+#[derive(InitSpace)]
+pub struct TaxReport {
+    pub token: Pubkey,
+    /// The audit cycle reported on (AuditCycle.period_id).
+    pub period_id: u64,
+    pub accountant: Pubkey,
+    pub book_total: u64,
+    /// Hash of the report document.
+    pub report_hash: [u8; 32],
+    pub filed_ts: i64,
+    /// Filed again during a hold (a reconciled report).
+    pub refiled: bool,
+    pub bump: u8,
+}
+
+// ============================ Distribution ============================
+
+/// Local partner registered by the operator. It operates restamps for the companies it serves and receives its
+/// share of the operator's fee on every conversion.
+#[account]
+#[derive(InitSpace)]
+pub struct LocalPartnerRecord {
+    pub partner: Pubkey,
+    /// The partner's USDC account (fixed at registration; conversions pay its share only here).
+    pub usdc_account: Pubkey,
+    /// Share of the operator's fee (bps), decided at registration.
+    pub share_bps: u16,
+    pub active: bool,
+    pub bump: u8,
+}
+
+// ============================ Perks ============================
+
+/// Perk terms negotiated per company (set by the operator). The rules fixed in code are checked in rules.rs.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace)]
+pub struct PerkParams {
+    /// How the obligation is delivered: general returns ≥ trader perk ≥ hold perk, 100% in total (bps).
+    pub general_bps: u16,
+    pub trader_bps: u16,
+    pub hold_bps: u16,
+    /// Hold perk rate by time since the stamp, one entry per step; 0% after the last step (non-increasing).
+    pub hold_rate_bps: [u16; HOLD_STEPS],
+    /// Length of one step (seconds).
+    pub hold_step_secs: i64,
+    /// Purchases eligible for the hold perk per whole token of the period's minimum balance (obligation units).
+    pub cap_per_token: u64,
+    /// Restamp fee (bps of the restamped amount), paid to the local partner in tokens. 0 works.
+    pub restamp_fee_bps: u16,
+    /// Highest ask for listed trader perks (bps of the face value). 0 = this company does not allow listing.
+    pub max_ask_bps: u16,
+    /// Share of a bill that listed trader perks may pay (bps). 0 = this company does not allow listing.
+    pub usage_cap_bps: u16,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct PerkTerms {
+    pub token: Pubkey,
+    pub params: PerkParams,
+    pub bump: u8,
+}
+
+/// Perk budget of a period: the previous period's obligation × the allocation. Perks cannot exceed it, so the rest
+/// of the obligation can only be delivered as general returns.
+#[account]
+#[derive(InitSpace)]
+pub struct PerkPeriod {
+    pub token: Pubkey,
+    pub period_id: u64,
+    pub trader_budget: u64,
+    pub hold_budget: u64,
+    /// Trader perk rate (bps of the volume a registered account sent in the previous period): the budget divided by
+    /// the volume of all registered accounts, at most half the transfer fee rate (self-dealing always loses).
+    pub trader_rate_bps: u16,
+    pub trader_used: u64,
+    pub hold_used: u64,
+    pub bump: u8,
+    /// Rate of last period's volume that can be listed for sale (rules::listable_rate_bps). Fixed with the budget.
+    pub listable_rate_bps: u16,
+    /// The company's ask cap and usage cap, fixed for the period so a later change of terms cannot affect its lots.
+    pub max_ask_bps: u16,
+    pub usage_cap_bps: u16,
+}
+
+/// Merchant registered by the issuer (perks are redeemed only with a registered merchant's signature).
+#[account]
+#[derive(InitSpace)]
+pub struct MerchantRecord {
+    pub token: Pubkey,
+    pub merchant: Pubkey,
+    pub active: bool,
+    pub bump: u8,
+}
+
+/// Perk usage of a registered token account in its current period (reset when the period changes).
+#[account]
+#[derive(InitSpace)]
+pub struct HolderPerk {
+    pub token: Pubkey,
+    /// The registered token account.
+    pub account: Pubkey,
+    pub period_id: u64,
+    /// Trader perks used or listed this period.
+    pub trader_used: u64,
+    /// Purchases that used the hold perk this period (capped by minimum balance × cap per token).
+    pub hold_spend: u64,
+    pub bump: u8,
+}
+
+impl HolderPerk {
+    /// Starts the period's counts over the first time the account is used in a new period.
+    pub fn enter_period(&mut self, period: u64) {
+        if self.period_id != period {
+            self.period_id = period;
+            self.trader_used = 0;
+            self.hold_spend = 0;
+        }
+    }
+}
+
+/// Trader perks a seller set aside for customers in a period. The right moves to a customer at checkout (off-chain) and
+/// is used on the spot; the issuer's ledger pays the merchant and the seller through the existing audit and payout.
+#[account]
+#[derive(InitSpace)]
+pub struct PerkLot {
+    pub token: Pubkey,
+    pub period_id: u64,
+    /// The seller's registered token account the perks came from.
+    pub account: Pubkey,
+    pub seller: Pubkey,
+    /// Face value set aside so far (obligation units).
+    pub listed: u64,
+    pub bump: u8,
+}
+
+/// Receipt of a perk redemption. It goes into the issuer's ledger and through the existing audit and payout.
+#[account]
+#[derive(InitSpace)]
+pub struct PerkReceipt {
+    pub token: Pubkey,
+    pub period_id: u64,
+    pub account: Pubkey,
+    pub merchant: Pubkey,
+    pub kind: u8,
+    /// Discount delivered (obligation units).
+    pub discount: u64,
     pub bump: u8,
 }

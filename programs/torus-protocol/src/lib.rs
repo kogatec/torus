@@ -13,8 +13,12 @@ pub mod constants;
 pub mod errors;
 pub mod state;
 pub mod instructions;
+pub mod rules;
+pub mod tax_rules;
 
+use constants::TIERS;
 use instructions::*;
+use state::PerkParams;
 
 declare_id!("6n1Nme9H1aUoXY2P2RaHBVWKAHHyEVPjx9n8WdU8oGdR");
 
@@ -23,8 +27,10 @@ pub mod torus_protocol {
     use super::*;
 
     /// Initializes the protocol: USDC mint, transfer hook program id, the compensation pool that receives
-    /// slashed bonds, the operator treasury, the minimum sample size and the minimum bond target.
-    /// Only the program's upgrade authority can call it.
+    /// slashed bonds, the operator treasury, the minimum sample size and the minimum bond target. Only the program's
+    /// upgrade authority can call it.
+    /// It also fixes the hold period of the tax reconciliation.
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         ctx: Context<Initialize>,
         usdc_mint: Pubkey,
@@ -33,6 +39,7 @@ pub mod torus_protocol {
         treasury: Pubkey,
         min_sample_size: u16,
         min_bond_target: u64,
+        tax_hold_period: i64,
     ) -> Result<()> {
         instructions::initialize::handler(
             ctx,
@@ -42,12 +49,14 @@ pub mod torus_protocol {
             treasury,
             min_sample_size,
             min_bond_target,
+            tax_hold_period,
         )
     }
 
     /// Registers a Token-2022 mint with the TransferFee and TransferHook extensions after checking that no
     /// issuer key can change the rules, and creates its TokenState and USDC accounts (redemption pool,
     /// slashing bond, issuer escrow, fee vault). The bond target is set by the operator (set_issuer_terms).
+    /// The mint authority moves to the program: afterwards only restamp mints, never more than it burns.
     pub fn issue_token(
         ctx: Context<IssueToken>,
         transfer_fee_bps: u16,
@@ -56,14 +65,15 @@ pub mod torus_protocol {
         instructions::issue_token::handler(ctx, transfer_fee_bps, max_fee)
     }
 
-    /// Terms the operator sets per company: the bond target and the minimum price for converting fees
-    /// (Config.authority only).
+    /// Terms the operator sets per company: the bond target, the minimum price for converting fees, the issuer's
+    /// share per rank and the local partner (Config.authority only).
     pub fn set_issuer_terms(
         ctx: Context<SetIssuerTerms>,
         bond_target: u64,
         min_conversion_price: u64,
+        tier_share_bps: [u16; TIERS],
     ) -> Result<()> {
-        instructions::set_issuer_terms::handler(ctx, bond_target, min_conversion_price)
+        instructions::set_issuer_terms::handler(ctx, bond_target, min_conversion_price, tier_share_bps)
     }
 
     /// Adds an exchange partner to the operator's registry (Config.authority only).
@@ -73,18 +83,13 @@ pub mod torus_protocol {
 
     /// A registered partner buys collected fee tokens for USDC. In the same instruction the USDC is split into
     /// the operator's share and the issuer's share, and the issuer's share goes to the bond, then the
-    /// redemption pool (up to what is owed), then the issuer escrow.
+    /// redemption pool (up to what is owed), then the issuer escrow (after an exit: to the redemption pool).
     pub fn convert_fees<'info>(
         ctx: Context<'_, '_, '_, 'info, ConvertFees<'info>>,
         token_amount: u64,
         usdc_amount: u64,
     ) -> Result<()> {
         instructions::convert_fees::handler(ctx, token_amount, usdc_amount)
-    }
-
-    /// Pays the issuer share that passed a clean audit to the issuer's USDC account (anyone can call).
-    pub fn claim_distribution(ctx: Context<ClaimDistribution>) -> Result<()> {
-        instructions::claim_distribution::handler(ctx)
     }
 
     /// Replaces an auditor who did not record by the deadline, or whose registration was revoked, with another
@@ -97,8 +102,11 @@ pub mod torus_protocol {
     /// from the issuer; the return rate must be at least the floor; tolerances and the allowed defect count are
     /// capped.
     ///
-    /// `term_len` (seconds) is the manifest's term (a campaign). After `valid_until` no new commitment is
-    /// accepted until new rules are fixed. Two layers: the term (campaign) ⊃ settlement periods (period_id).
+    /// `term_len` (seconds) is the manifest's term (a campaign). A period that starts after `valid_until` gets no
+    /// obligation until new rules are fixed. Two layers: the term (campaign) ⊃ settlement periods (period_id).
+    /// During a campaign nothing may change in the issuer's favor, and every period keeps the terms in force when it
+    /// started. `use_plan_hash` is the hash of the use plan for the issuer escrow.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_manifest(
         ctx: Context<SetManifest>,
         return_rate_bps: u16,
@@ -109,6 +117,7 @@ pub mod torus_protocol {
         term_len: i64,
         sample_size: u16,
         max_defects: u16,
+        use_plan_hash: [u8; 32],
     ) -> Result<()> {
         instructions::set_manifest::handler(
             ctx,
@@ -120,11 +129,12 @@ pub mod torus_protocol {
             term_len,
             sample_size,
             max_defects,
+            use_plan_hash,
         )
     }
 
-    /// Closes a period: derives the obligation from the period's on-chain volume × the fixed return rate and
-    /// reserves it in the redemption pool. Not available until the bond reaches its target; the first call
+    /// Closes a period: derives the obligation from the period's on-chain volume × the return rate in force when the
+    /// period started (none between campaigns) and reserves it in the redemption pool. Not available until the bond reaches its target; the first call
     /// after that only sets the metering baseline.
     pub fn provision_budget(ctx: Context<ProvisionBudget>) -> Result<()> {
         instructions::provision_budget::handler(ctx)
@@ -252,7 +262,8 @@ pub mod torus_protocol {
         instructions::request_exit::handler(ctx)
     }
 
-    /// Finalizes a voluntary exit (anyone can call): half the bond goes to the issuer, the rest to the operator treasury.
+    /// Finalizes a voluntary exit (anyone can call): the issuer's half of the bond and what is left in the escrow go to
+    /// the redemption pool (its customers, through liquidation), the rest of the bond to the operator treasury.
     pub fn finalize_exit(ctx: Context<FinalizeExit>) -> Result<()> {
         instructions::finalize_exit::handler(ctx)
     }
@@ -272,5 +283,119 @@ pub mod torus_protocol {
         siblings: Vec<SumSibling>,
     ) -> Result<()> {
         instructions::claim_liquidation::handler(ctx, index, outcome_id, value, siblings)
+    }
+
+    /// Revokes an exchange partner's registration (operator only). A revoked partner cannot convert fees or approve
+    /// escrow payments, and an issuer whose escrow partner was revoked may pick another one during a campaign.
+    pub fn revoke_partner(ctx: Context<RevokePartner>) -> Result<()> {
+        instructions::revoke_partner::handler(ctx)
+    }
+
+    /// The issuer picks the registered partner that manages its escrow (one per token; locked during a campaign
+    /// unless revoked). The partner, the auditor and the issuer are different keys; the partner is not the operator.
+    pub fn set_escrow_partner(ctx: Context<SetEscrowPartner>) -> Result<()> {
+        instructions::set_escrow_partner::handler(ctx)
+    }
+
+    /// The issuer requests a payment from its escrow: an item of the use plan, the amount (within the balance released
+    /// by clean audits), the payee (not the issuer) and the invoice hash (used once). With `from_bond` the payment comes
+    /// from the bond instead, which must keep at least half of its target (later fees refill it; redemptions go on).
+    pub fn request_withdrawal(
+        ctx: Context<RequestWithdrawal>,
+        plan_item: u16,
+        amount: u64,
+        invoice_hash: [u8; 32],
+        from_bond: bool,
+    ) -> Result<()> {
+        instructions::request_withdrawal::handler(ctx, plan_item, amount, invoice_hash, from_bond)
+    }
+
+    /// The escrow partner or the manifest's auditor approves a request; with both approvals it pays the payee straight
+    /// from the escrow. The operator and the issuer cannot approve.
+    pub fn approve_withdrawal(ctx: Context<ApproveWithdrawal>) -> Result<()> {
+        instructions::approve_withdrawal::handler(ctx)
+    }
+
+    // ============================ Tax accountant reconciliation ============================
+
+    /// Registers the company's tax accountant (operator; the accountant signs its consent to the warning).
+    pub fn register_tax_accountant(ctx: Context<RegisterTaxAccountant>, consent_hash: [u8; 32]) -> Result<()> {
+        instructions::tax_accountant::register(ctx, consent_hash)
+    }
+
+    /// Revokes the company's tax accountant (operator).
+    pub fn revoke_tax_accountant(ctx: Context<RevokeTaxAccountant>) -> Result<()> {
+        instructions::tax_accountant::revoke(ctx)
+    }
+
+    /// Replaces the company's tax accountant (operator; the new accountant signs its consent).
+    pub fn replace_tax_accountant(ctx: Context<ReplaceTaxAccountant>, consent_hash: [u8; 32]) -> Result<()> {
+        instructions::tax_accountant::replace(ctx, consent_hash)
+    }
+
+    /// The tax accountant reports the book's sub-account total for the cycle being audited (by the audit deadline; during
+    /// a hold, a reconciled report until the hold ends).
+    pub fn file_tax_report(ctx: Context<FileTaxReport>, book_total: u64, report_hash: [u8; 32]) -> Result<()> {
+        instructions::file_tax_report::handler(ctx, book_total, report_hash)
+    }
+
+    // ============================ Distribution ============================
+
+    /// Registers a local partner with its share of the operator's fee and its USDC account (operator).
+    pub fn register_local_partner(ctx: Context<RegisterLocalPartner>, share_bps: u16) -> Result<()> {
+        instructions::local_partner::register(ctx, share_bps)
+    }
+
+    /// Revokes a local partner (operator): no more restamps; its share goes to the treasury.
+    pub fn revoke_local_partner(ctx: Context<RevokeLocalPartner>) -> Result<()> {
+        instructions::local_partner::revoke(ctx)
+    }
+
+    // ============================ Perks ============================
+
+    /// Perk terms negotiated with the company (operator).
+    pub fn set_perk_terms(ctx: Context<SetPerkTerms>, params: PerkParams) -> Result<()> {
+        instructions::perk_terms::handler(ctx, params)
+    }
+
+    /// Registers a merchant (issuer).
+    pub fn register_merchant(ctx: Context<RegisterMerchant>) -> Result<()> {
+        instructions::merchant::register(ctx)
+    }
+
+    /// Revokes a merchant (issuer).
+    pub fn revoke_merchant(ctx: Context<RevokeMerchant>) -> Result<()> {
+        instructions::merchant::revoke(ctx)
+    }
+
+    /// Registers one of the holder's token accounts for perks (its balance starts stamped at 0%).
+    pub fn register_holder(ctx: Context<RegisterHolder>) -> Result<()> {
+        instructions::register_holder::handler(ctx)
+    }
+
+    /// Opens the current period's perk budget: the previous obligation × the allocation (anyone).
+    pub fn open_perk_period(ctx: Context<OpenPerkPeriod>) -> Result<()> {
+        instructions::open_perk_period::handler(ctx)
+    }
+
+    /// Records a perk (trader or hold), signed by a registered merchant and the holder.
+    pub fn redeem_perk(ctx: Context<RedeemPerk>, kind: u8, amount: u64, receipt_id: [u8; 32]) -> Result<()> {
+        instructions::redeem_perk::handler(ctx, kind, amount, receipt_id)
+    }
+
+    /// Burns, re-mints the same amount (minus the fee to the local partner) and restamps, signed by the holder and the
+    /// local partner.
+    pub fn restamp(ctx: Context<Restamp>, amount: u64) -> Result<()> {
+        instructions::restamp::handler(ctx, amount)
+    }
+
+    /// Sets aside part of a trader perk for customers, signed by the seller and the local partner.
+    pub fn list_perk(ctx: Context<ListPerk>, amount: u64) -> Result<()> {
+        instructions::perk_lot::list(ctx, amount)
+    }
+
+    /// Returns a lot's rent to the seller after its period is closed.
+    pub fn close_perk_lot(ctx: Context<ClosePerkLot>) -> Result<()> {
+        instructions::perk_lot::close(ctx)
     }
 }

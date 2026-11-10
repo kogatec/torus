@@ -3,7 +3,8 @@
 //! Records the commitment to the whole ledger (Merkle-sum root commitment) and the control total (the issuer's
 //! declared total), and starts the AuditCycle. Binding the whole set before the sample is drawn rules out
 //! swapping entries afterwards (the commit slot is recorded as the reference for post-commit entropy).
-//! Signed by the issuer. Not possible without a provisioned budget (budget == 0).
+//! Signed by the issuer. Not possible without a provisioned budget (budget == 0). After the campaign has ended, the audit
+//! of a period that started during it still runs (a period that started in the gap has no budget to commit to).
 
 use anchor_lang::prelude::*;
 
@@ -20,11 +21,6 @@ pub fn handler(
     // No new commitment while frozen.
     require!(!ctx.accounts.token_state.frozen, TorusError::TokenFrozen);
     require!(!ctx.accounts.token_state.exited, TorusError::TokenExited);
-    // The manifest must not have expired (no commitment under an expired campaign).
-    require!(
-        Clock::get()?.unix_timestamp <= ctx.accounts.manifest.valid_until,
-        TorusError::ManifestExpired
-    );
     // A budget must be provisioned: no commitment without an obligation to measure against.
     require!(
         ctx.accounts.token_state.budget > 0,
@@ -36,6 +32,8 @@ pub fn handler(
     let token_state = &ctx.accounts.token_state;
     let manifest = &ctx.accounts.manifest;
     let audit = &mut ctx.accounts.audit;
+    // Judging terms of the audited period: those in force when it started (fixed by provision_budget).
+    let terms = token_state.cycle_terms;
 
     audit.token = token_state.mint;
     audit.period_id = token_state.period_id;
@@ -49,14 +47,14 @@ pub fn handler(
     //   (no loosening thresholds after observations are known, no swapping the obligation afterwards,
     //    no swapping the auditor mid-cycle).
     audit.obligation = token_state.budget;
-    audit.tolerance_bps = manifest.tolerance_bps;
-    audit.shortfall_tolerance_bps = manifest.shortfall_tolerance_bps;
+    audit.tolerance_bps = terms.tolerance_bps;
+    audit.shortfall_tolerance_bps = terms.shortfall_tolerance_bps;
     audit.auditor = manifest.auditor;
     // Fix the sample size here too (the value fixed in the manifest; if larger than the population, check all).
     // Whoever designates the sample cannot choose its size.
-    audit.sample_size = (manifest.sample_size as u32).min(population_size) as u16;
+    audit.sample_size = (terms.sample_size as u32).min(population_size) as u16;
     // Fix the allowed defect count; if the sample shrank to the whole population, keep it within 20% of it.
-    audit.max_defects = manifest.max_defects.min(
+    audit.max_defects = terms.max_defects.min(
         ((audit.sample_size as u64) * MAX_DEFECT_RATE_BPS / BPS_DENOMINATOR) as u16,
     );
 
@@ -92,7 +90,8 @@ pub struct CommitPerformance<'info> {
     )]
     pub token_state: Account<'info, TokenState>,
 
-    /// Current manifest: source of the judging parameters and the auditor snapshotted into the cycle.
+    /// Current manifest: source of the auditor snapshotted into the cycle (the judging parameters come from
+    /// TokenState.cycle_terms, the terms of the audited period).
     #[account(
         seeds = [MANIFEST_SEED, token_state.mint.as_ref()],
         bump = manifest.bump,

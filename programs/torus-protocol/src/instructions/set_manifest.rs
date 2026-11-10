@@ -3,13 +3,16 @@
 //! Fixes the manifest before the ledger is built. Invariants:
 //!   - only the issuer (token_state.issuer) can sign;
 //!   - the auditor differs from the issuer (the issuer cannot audit itself) and is registered;
-//!   - the return rate is at least the floor (min_return_rate_bps).
+//!   - the return rate is at least the floor (min_return_rate_bps);
+//!   - during a campaign (before valid_until) nothing may change in the issuer's favor: the return rate, tolerances,
+//!     sample size, allowed defects, term and use plan can only stay or get stricter (the auditor may change);
+//!   - a period keeps the terms in force when it started: the replaced terms are kept in prev_terms.
 
 use anchor_lang::prelude::*;
 
 use crate::constants::*;
 use crate::errors::TorusError;
-use crate::state::{AuditorRecord, Config, Manifest, TokenState};
+use crate::state::{AuditorRecord, Config, Manifest, ManifestTerms, TokenState};
 
 pub fn handler(
     ctx: Context<SetManifest>,
@@ -21,6 +24,7 @@ pub fn handler(
     term_len: i64,
     sample_size: u16,
     max_defects: u16,
+    use_plan_hash: [u8; 32],
 ) -> Result<()> {
     // Floor: the return rate must be at least this.
     require!(
@@ -60,8 +64,50 @@ pub fn handler(
     let issuer_key = ctx.accounts.issuer.key();
     let auditor_key = ctx.accounts.auditor.key();
     require_keys_neq!(auditor_key, issuer_key, TorusError::AuditorNotIndependent);
+    // Nor can the escrow partner: the two approvals of an escrow payment come from different keys.
+    let escrow_partner = ctx.accounts.token_state.escrow_partner;
+    require!(
+        escrow_partner == Pubkey::default() || auditor_key != escrow_partner,
+        TorusError::RolesNotSeparate
+    );
 
+    let now = Clock::get()?.unix_timestamp;
+    let valid_until = now.checked_add(term_len).ok_or(TorusError::MathOverflow)?;
+    let ts = &ctx.accounts.token_state;
     let manifest = &mut ctx.accounts.manifest;
+    let exists = manifest.token == ts.mint;
+
+    // ===== During a campaign: no change in the issuer's favor =====
+    if exists && now <= manifest.valid_until {
+        require!(
+            return_rate_bps >= manifest.return_rate_bps
+                && tolerance_bps <= manifest.tolerance_bps
+                && shortfall_tolerance_bps <= manifest.shortfall_tolerance_bps
+                && sample_size >= manifest.sample_size
+                && max_defects <= manifest.max_defects
+                && valid_until >= manifest.valid_until
+                && use_plan_hash == manifest.use_plan_hash,
+            TorusError::ManifestChangeFavorsIssuer
+        );
+    }
+
+    // ===== Periods keep the terms in force when they started =====
+    // The oldest open period (period_start_ts) is judged by Manifest::terms_at. If it started before the current terms
+    // took effect, it still needs prev_terms; the current terms can then be replaced only if no period started while
+    // they were in force (otherwise close the elapsed periods first).
+    if !exists {
+        manifest.prev_terms = ManifestTerms::default();
+    } else if ts.periods_started && ts.period_start_ts < manifest.valid_from {
+        let len = ts.grid_period_len;
+        let first_start = ts
+            .grid_start_ts
+            .checked_add((manifest.valid_from - ts.grid_start_ts + len - 1) / len * len)
+            .ok_or(TorusError::MathOverflow)?;
+        require!(first_start >= now, TorusError::PeriodsNotClosed);
+    } else {
+        manifest.prev_terms = manifest.terms();
+    }
+
     manifest.token = ctx.accounts.token_state.mint;
     manifest.return_rate_bps = return_rate_bps;
     manifest.tolerance_bps = tolerance_bps;
@@ -73,10 +119,9 @@ pub fn handler(
     manifest.sample_size = sample_size;
     manifest.max_defects = max_defects;
     // Expiry = now + term. After it, this instruction fixes the next campaign.
-    manifest.valid_until = Clock::get()?
-        .unix_timestamp
-        .checked_add(term_len)
-        .ok_or(TorusError::MathOverflow)?;
+    manifest.valid_until = valid_until;
+    manifest.valid_from = now;
+    manifest.use_plan_hash = use_plan_hash;
     manifest.bump = ctx.bumps.manifest;
 
     let manifest_key = manifest.key();

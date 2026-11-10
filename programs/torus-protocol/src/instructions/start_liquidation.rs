@@ -5,7 +5,8 @@
 //! paid through payout (recognized unpaid rights come first). The surplus is split over the leaves of the last
 //! audit finalized without fraud, pro rata to their confirmed amounts (claim_liquidation). The issuer gets none.
 //! If no audit was ever finalized without fraud, there is no basis for a split and the surplus goes to the
-//! compensation pool fixed in Config.
+//! compensation pool fixed in Config; issuer shares that arrive after an exit are swept there the same way by calling
+//! this again. With a basis they are added to the split by convert_fees.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
@@ -18,7 +19,10 @@ pub fn handler(ctx: Context<StartLiquidation>) -> Result<()> {
     let vault_balance = ctx.accounts.redemption_vault.amount;
     let ts = &mut ctx.accounts.token_state;
     require!(ts.frozen || ts.exited, TorusError::LiquidationNotAllowed);
-    require!(!ts.liquidation_started, TorusError::LiquidationAlreadyStarted);
+    require!(
+        !ts.liquidation_started || ts.last_good_period == 0,
+        TorusError::LiquidationAlreadyStarted
+    );
 
     let pool = vault_balance.saturating_sub(ts.reserved);
     ts.liquidation_started = true;

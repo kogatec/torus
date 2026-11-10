@@ -4,6 +4,7 @@
 //! token) and the transfer hook program id (burned into each mint's TransferHook at issuance). It also fixes
 //! where slashed bonds go, the treasury that receives the operator's share of converted fees, and the
 //! minimum bond target (min_bond_target); each company's bond target must be at least this.
+//! The hold period of the tax reconciliation (tax_hold_period) is fixed here too, so no company can change it.
 
 use anchor_lang::prelude::*;
 
@@ -20,11 +21,13 @@ pub fn handler(
     treasury: Pubkey,
     min_sample_size: u16,
     min_bond_target: u64,
+    tax_hold_period: i64,
 ) -> Result<()> {
     require!(
         min_sample_size > 0 && (min_sample_size as usize) <= MAX_SAMPLE_SIZE,
         TorusError::InvalidSampleSize
     );
+    require!(tax_hold_period > 0, TorusError::InvalidHoldPeriod);
     let config = &mut ctx.accounts.config;
     config.authority = ctx.accounts.authority.key();
     config.usdc_mint = usdc_mint;
@@ -34,6 +37,7 @@ pub fn handler(
     config.min_sample_size = min_sample_size;
     config.treasury = treasury;
     config.min_bond_target = min_bond_target;
+    config.tax_hold_period = tax_hold_period;
 
     msg!(
         "initialize: authority={} usdc_mint={} hook_program={} slash_destination={} treasury={}",

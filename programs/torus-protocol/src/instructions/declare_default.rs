@@ -56,7 +56,7 @@ pub fn handler(ctx: Context<DeclareDefault>) -> Result<()> {
     token_state.tier = 0;
     token_state.consecutive_passes = 0;
     token_state.frozen = true;
-    token_state.distribution_ratio_bps = TIER_DISTRIBUTION_BPS[0];
+    token_state.distribution_ratio_bps = token_state.tier_share_bps[0];
 
     // Slash the whole bond to the compensation pool (fixed in Config).
     let bond_balance = ctx.accounts.slashing_bond.amount;

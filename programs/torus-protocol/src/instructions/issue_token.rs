@@ -12,8 +12,14 @@
 //!   - withheld fees can only be withdrawn by the protocol PDA; no freeze authority; only allowed extensions
 //! USDC is a classic SPL token, so the pool accounts use `usdc_token_program`
 //! (a different program from the brand token's Token-2022).
+//!
+//! [Mint authority] At the end the mint authority moves from the issuer to the pool PDA, so the issuer can no longer
+//! mint at will. Afterwards only restamp mints, signed by the holder and the local partner, and only as much as it
+//! burned in the same instruction: the supply never grows.
 
 use anchor_lang::prelude::*;
+use anchor_spl::token_2022::spl_token_2022::instruction::AuthorityType;
+use anchor_spl::token_2022::{set_authority, SetAuthority};
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use anchor_spl::token_2022::spl_token_2022::{
     extension::{
@@ -139,7 +145,9 @@ pub fn handler(
 
     ts.tier = 0;
     ts.consecutive_passes = 0;
-    ts.distribution_ratio_bps = TIER_DISTRIBUTION_BPS[0];
+    ts.distribution_ratio_bps = 0; // the issuer's share per rank is set by the operator with set_issuer_terms.
+    ts.tier_share_bps = [0; TIERS];
+    ts.local_partner = Pubkey::default();
 
     ts.prior_period_activity = 0;
     ts.current_period_activity = 0;
@@ -170,6 +178,19 @@ pub fn handler(
     ts.issuer_claimable = 0;
     ts.reserved = 0;
 
+    // The mint authority moves to the pool PDA (the issuer signs as the current authority).
+    set_authority(
+        CpiContext::new(
+            ctx.accounts.token_2022_program.to_account_info(),
+            SetAuthority {
+                current_authority: ctx.accounts.issuer.to_account_info(),
+                account_or_mint: ctx.accounts.mint.to_account_info(),
+            },
+        ),
+        AuthorityType::MintTokens,
+        Some(ctx.accounts.pool_authority.key()),
+    )?;
+
     msg!(
         "issue_token: mint={} issuer={} (USDC pool initialized; bond target is set by the operator)",
         ts.mint,
@@ -188,7 +209,8 @@ pub struct IssueToken<'info> {
     pub config: Account<'info, Config>,
 
     /// The Token-2022 mint created client-side (with TransferFee and TransferHook).
-    /// Its extensions are verified in the handler.
+    /// Its extensions are verified in the handler; its mint authority moves to the pool PDA.
+    #[account(mut)]
     pub mint: InterfaceAccount<'info, Mint>,
 
     /// Pool currency (USDC).

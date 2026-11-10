@@ -10,7 +10,7 @@
  *   (f) self-transfers are not counted as volume (but count for the fee cross-check)
  *   (g) the fee cross-check runs and matches exactly
  *   (h) fees implied without being collected → CrossCheckMismatch
- *   (i) no commitment under an expired manifest
+ *   (i) after the manifest expires a period gets no obligation, so nothing can be committed; a new campaign brings it back
  *   Fixed holes (each test checks the attack fails and the legitimate operation still works):
  *   (j) a payout goes only to the committed leaf's recipient, the confirmed amount, once (anyone could drain the pool)
  *   (k) only the upgrade authority can initialize (front-running right after deployment)
@@ -33,14 +33,61 @@
  *   (h) also checks that unpaid redemptions are kept aside before the next provision
  *   Exit decisions and remaining holes:
  *   (y) a period with zero volume (budget 0) does not stop the next one (the cycle used to stall forever)
- *   (z) voluntary exit: the obligation runs to the requested period; after its audit, half the bond to the issuer and
- *       half to the operator; fees after the exit are split; liquidation shares the pool's surplus among recipients
+ *   (z) voluntary exit: the obligation runs to the requested period; after its audit, half the bond to customers (the
+ *       redemption pool) and half to the operator; the issuer share of fees after the exit goes to customers too;
+ *       liquidation shares the pool's surplus among recipients
  *   (aa) defects are judged by count: 21 samples with 0 allowed → one defect is overstatement (a ratio check let it pass)
  *   (ab) fixed period boundaries: a late close still assigns volume to the right period
  *   (ac) uniqueness: duplicates in the tree, root mismatch, finalizing unverified, and reuse in a later period are rejected
  *   (ae) payouts only for confirmed leaves up to the confirmed amount; after a freeze, finalized recipients are still paid and the surplus is liquidated
  *   (af) auditor revocation: a revoked auditor cannot record or confirm, a manifest naming it cannot start a new audit,
  *        and the operator replaces it without waiting; the new auditor observes again and the audit continues
+ *   End of a manifest and the next one; the issuer escrow (2026-10-17):
+ *   (ag) after the term ends, a period that started during the campaign is still audited from commitment to
+ *        finalization, and is not slashed or frozen for it
+ *   (ah) between campaigns no obligation arises and no default can be declared; the carried shortfall is kept and settled
+ *        by the exit's final audit (or the next campaign)
+ *   (ai) a manifest change does not touch periods that started before it; gap volume is not counted; tier, streak,
+ *        bond and used payment IDs carry over
+ *   (aj) during a campaign the manifest cannot change in the issuer's favor; a new auditor, a higher rate and a longer
+ *        term are allowed
+ *   (ak) a clean audit releases the issuer share inside the escrow; nothing is paid to the issuer's account
+ *   (al) one escrow partner per token, picked by the issuer from the registry; locked during a campaign unless revoked
+ *        (the operator revokes partners); issuer, auditor and partner are separate keys
+ *   (am) the manifest records the hash of the use plan
+ *   (an) withdrawal requests: a manifest in force with a use plan, within the released balance, never to the issuer,
+ *        one per invoice
+ *   (ao) a request runs only with both the escrow partner's and the auditor's approval and pays the payee straight from
+ *        the escrow; never with one of them, the issuer or the operator
+ *   (ap) fraud slashes everything left in the escrow (regression); pending requests cannot run
+ *   (aq) on exit the escrow's remainder and the issuer's half of the bond go to customers through liquidation, and so
+ *        do issuer shares that arrive after the exit
+ *   (ar) when the company needs funds it can request a payment from the bond: down to half of the bond target, with the
+ *        escrow partner's and the auditor's approval, straight to the payee; redemptions go on and later fees refill it
+ *   Tax accountant reconciliation (2026-11-02):
+ *   (as) the tax accountant is registered by the operator with its own signature (never the issuer's key) and files the
+ *        book total; a declared total within the book total passes
+ *   (at) a declared total above the book total holds the cycle (payouts wait); a reconciled report resumes it
+ *   (au) a reconciled report that still shows a gap: only the book total is recognized, the rest is carried, no pass
+ *   (av) no reconciled report within the hold forfeits the cycle; no report by the deadline is a default; late reports
+ *        are rejected
+ *   Distribution, issuance authority and perks (2026-11-02):
+ *   (aw) per-company rank table and local partner: the rules are enforced and the operator's share is split with the
+ *        partner
+ *   (ax) the mint authority moves to the program; only a restamp mints, signed by the holder and the local partner, never
+ *        more than it burns
+ *   (ay) perks: registration starts at 0%, received tokens carry today's stamp, budgets come from the previous obligation,
+ *        trader and hold perks stay within allowances and budgets
+ *   The perk market (2026-11-06):
+ *   (be) listing moves part of the trader perk into the seller's lot: within the allowance, with the local partner's
+ *        signature, sharing one allowance with the seller's own use
+ *   (bf) what can be listed is capped below half the fee when the issuer's share would let an insider profit
+ *   (bg) a customer's use settles through the existing audit and payout: the pool pays the face value, split between the
+ *        merchant and the seller; the lot's rent comes back after its period closes
+ *   (bh) a company can turn listing off for a period, and later terms do not change an open period
+ *   (bi) a freeze stops listing; the lot can still be closed
+ *   (bj) a local partner's share lowers what can be listed; a revoked partner's does not
+ *   (bk) an account that changes hands mid-period cannot redirect its lot
  *
  * Claimed values (per sample and in total) are not reported by anyone: they are fixed on-chain by disclosure proofs
  * (verify_disclosure) against the Merkle sum tree, one per sample. The auditor records an observed value per sample and
@@ -72,6 +119,7 @@ import {
   mintToChecked,
   approveChecked,
   getAccount,
+  getMint,
   createInitializeMintInstruction,
   createInitializeTransferFeeConfigInstruction,
   createInitializeTransferHookInstruction,
@@ -79,6 +127,9 @@ import {
   createSetTransferFeeInstruction,
   createSetAuthorityInstruction,
   createTransferCheckedWithTransferHookInstruction,
+  closeAccount,
+  setAuthority,
+  getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import { assert } from "chai";
 import { keccak_256 } from "@noble/hashes/sha3";
@@ -115,6 +166,29 @@ const OBLIGATION = (VOLUME * RETURN_RATE_BPS) / BPS; // 1_000_000
 const POP = 8; // population (entries in the ledger)
 // Deposit enough to fill the bond first and leave at least the budget in the redemption pool.
 const DEPOSIT = BOND_TARGET.toNumber() + OBLIGATION + 500_000;
+// Hash of the use plan for the issuer escrow (the items and their caps are an off-chain document).
+const PLAN_HASH = Array.from(keccak_256(Buffer.from("use plan v1")));
+// Hold of the tax reconciliation (seconds; fixed at initialize). Short in tests.
+const TAX_HOLD = 6;
+// Book total the tax accountant files by default: far above any declared total, so the reconciliation is clear.
+const TAX_BOOK_DEFAULT = 1_000_000_000_000;
+// The issuer's share per rank, set per company (the values of the former fixed table).
+const TIER_SHARES = [2_000, 3_500, 5_000, 6_500];
+// Supply minted before issuance (afterwards only restamp can mint).
+const SUPPLY = 1_000_000_000_000_000;
+// Perk terms set per company.
+const PERKS = {
+  generalBps: 6_000,
+  traderBps: 2_500,
+  holdBps: 1_500,
+  holdRateBps: [3_000, 2_000, 1_000],
+  holdStepSecs: new BN(3_600),
+  capPerToken: new BN(1_000_000),
+  restampFeeBps: 0,
+  maxAskBps: 8_000,
+  usageCapBps: 3_000,
+};
+const consent = (s: string) => Array.from(keccak_256(Buffer.from(s)));
 
 describe("torus-protocol lifecycle", () => {
   const provider = anchor.AnchorProvider.env();
@@ -132,6 +206,10 @@ describe("torus-protocol lifecycle", () => {
   const slashDest = Keypair.generate();
   const treasuryOwner = Keypair.generate(); // owner of the operator treasury
   const partner = Keypair.generate(); // exchange partner
+  const localPartner = Keypair.generate(); // local partner (share 0, so the treasury figures of older tests hold)
+  const taxAccountant = Keypair.generate(); // the companies' tax accountant
+  /** Book total the accountant files right after a provision, per mint (default TAX_BOOK_DEFAULT; null = none). */
+  const taxBook = new Map<string, number | null>();
 
   let usdcMint: PublicKey;
   let depositorUsdc: PublicKey;
@@ -210,7 +288,15 @@ describe("torus-protocol lifecycle", () => {
     await airdrop(squatter.publicKey);
     const squat = await failure(
       program.methods
-        .initialize(usdcMint, hook.programId, slashDestAta, treasuryAta, MIN_SAMPLE, MIN_BOND)
+        .initialize(
+          usdcMint,
+          hook.programId,
+          slashDestAta,
+          treasuryAta,
+          MIN_SAMPLE,
+          MIN_BOND,
+          new BN(TAX_HOLD),
+        )
         .accounts({
           authority: squatter.publicKey,
           program: program.programId,
@@ -226,7 +312,15 @@ describe("torus-protocol lifecycle", () => {
 
     // Legitimate initialization (upgrade authority = the deploying key)
     await program.methods
-      .initialize(usdcMint, hook.programId, slashDestAta, treasuryAta, MIN_SAMPLE, MIN_BOND)
+      .initialize(
+        usdcMint,
+        hook.programId,
+        slashDestAta,
+        treasuryAta,
+        MIN_SAMPLE,
+        MIN_BOND,
+        new BN(TAX_HOLD),
+      )
       .accounts({
         authority: authority.publicKey,
         program: program.programId,
@@ -265,13 +359,81 @@ describe("torus-protocol lifecycle", () => {
     await airdrop(partner.publicKey, 2);
     partnerUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, partner.publicKey);
     await mintTo(connection, authority, usdcMint, partnerUsdc, authority, 1_000_000_000);
+
+    // The local partner (share 0: older tests keep the treasury's whole operator share)
+    await airdrop(taxAccountant.publicKey, 2);
+    await airdrop(localPartner.publicKey, 2);
+    await registerLocalPartnerTx(localPartner.publicKey, 0);
   });
+
+  async function registerLocalPartnerTx(p: PublicKey, shareBps: number, signer: Keypair = authority) {
+    const usdc = await createAssociatedTokenAccountIdempotent(connection, authority, usdcMint, p);
+    return program.methods
+      .registerLocalPartner(shareBps)
+      .accounts({
+        authority: signer.publicKey,
+        config: client.pdas.config()[0],
+        partner: p,
+        partnerUsdc: usdc,
+        localPartnerRecord: client.pdas.localPartner(p)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .signers(signer === authority ? [] : [signer])
+      .rpc();
+  }
+
+  /** Registers the tax accountant of a token once (operator + the accountant's signature). */
+  async function ensureTaxAccountant(mint: PublicKey) {
+    const record = client.pdas.taxAccountant(mint)[0];
+    if (await program.account.taxAccountantRecord.fetchNullable(record)) return;
+    await program.methods
+      .registerTaxAccountant(consent("warning and consent v1"))
+      .accounts({
+        authority: authority.publicKey,
+        config: client.pdas.config()[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        accountant: taxAccountant.publicKey,
+        taxAccountantRecord: record,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([taxAccountant])
+      .rpc();
+  }
+
+  /** The tax accountant reports the book total for the cycle being audited. */
+  async function fileTaxReportTx(mint: PublicKey, bookTotal: number, signer: Keypair = taxAccountant) {
+    const ts = await tokenState(mint);
+    return program.methods
+      .fileTaxReport(new BN(bookTotal), consent(`report ${bookTotal}`))
+      .accounts({
+        accountant: signer.publicKey,
+        tokenState: client.pdas.tokenState(mint)[0],
+        taxAccountantRecord: client.pdas.taxAccountant(mint)[0],
+        audit: client.pdas.audit(mint, ts.periodId)[0],
+        taxReport: client.pdas.taxReport(mint, ts.periodId)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([signer])
+      .rpc();
+  }
+
+  /** Right after a provision with an obligation, the accountant files its report (taxBook decides the figure). */
+  async function autoFileTaxReport(mint: PublicKey) {
+    const book = taxBook.has(mint.toBase58()) ? taxBook.get(mint.toBase58())! : TAX_BOOK_DEFAULT;
+    if (book === null) return;
+    const ts = await tokenState(mint);
+    if ((ts.budget as BN).eqn(0)) return;
+    if (await program.account.taxReport.fetchNullable(client.pdas.taxReport(mint, ts.periodId)[0])) return;
+    await fileTaxReportTx(mint, book);
+  }
 
   interface MintOpts {
     freezeAuthority?: PublicKey | null;
     permanentDelegate?: PublicKey;
     feeConfigAuthority?: PublicKey | null;
     maxFee?: number;
+    /** Mint authority (= the issuer) when it is not the operator's key. */
+    mintAuthority?: Keypair;
   }
 
   /**
@@ -319,10 +481,17 @@ describe("torus-protocol lifecycle", () => {
     }
     tx.add(
       createInitializeMintInstruction(
-        mintKp.publicKey, DECIMALS, authority.publicKey, opts.freezeAuthority ?? null, TOKEN_2022_PROGRAM_ID,
+        mintKp.publicKey, DECIMALS, (opts.mintAuthority ?? authority).publicKey, opts.freezeAuthority ?? null, TOKEN_2022_PROGRAM_ID,
       ),
     );
     await sendAndConfirmTransaction(connection, tx, [authority, mintKp]);
+    // The supply is minted before issuance: issue_token moves the mint authority to the program.
+    const supplyAta = await createAssociatedTokenAccountIdempotent(
+      connection, authority, mintKp.publicKey, authority.publicKey, undefined, TOKEN_2022_PROGRAM_ID,
+    );
+    await mintToChecked(
+      connection, authority, mintKp.publicKey, supplyAta, opts.mintAuthority ?? authority, SUPPLY, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID,
+    );
 
     await hook.methods
       .initializeExtraAccountMetaList()
@@ -369,7 +538,6 @@ describe("torus-protocol lifecycle", () => {
     const src = await createAssociatedTokenAccountIdempotent(connection, authority, mint, authority.publicKey, undefined, TOKEN_2022_PROGRAM_ID);
     const dstOwner = Keypair.generate();
     const dst = await createAssociatedTokenAccountIdempotent(connection, authority, mint, dstOwner.publicKey, undefined, TOKEN_2022_PROGRAM_ID);
-    await mintToChecked(connection, authority, mint, src, authority, amount * 2, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID);
     const ix = await createTransferCheckedWithTransferHookInstruction(
       connection, src, mint, dst, authority.publicKey, BigInt(amount), DECIMALS, [], "confirmed", TOKEN_2022_PROGRAM_ID,
     );
@@ -400,7 +568,7 @@ describe("torus-protocol lifecycle", () => {
     const pid: BN = ts.periodId;
     const owed = pid.gtn(0) && (ts.budget as BN).gtn(0); // a period with budget 0 has no audit cycle
     const prev = prevAudit !== undefined ? prevAudit : owed ? client.pdas.audit(mint, pid)[0] : null;
-    return program.methods
+    const sig = await program.methods
       .provisionBudget()
       .accounts({
         crank: authority.publicKey,
@@ -412,6 +580,8 @@ describe("torus-protocol lifecycle", () => {
         prevAudit: prev,
       })
       .rpc();
+    await autoFileTaxReport(mint);
+    return sig;
   }
 
   /**
@@ -434,24 +604,33 @@ describe("torus-protocol lifecycle", () => {
     sampleSize?: number;
     maxDefects?: number;
     auditor?: PublicKey;
+    returnRateBps?: number;
+    shortfallToleranceBps?: number;
+    planHash?: number[];
+    /** The issuer's key when it is not the operator's. */
+    issuer?: Keypair;
+    /** Floor of the return rate (default FLOOR_BPS). */
+    floorBps?: number;
   }
 
   /** Fixes (or re-fixes) the manifest. `termLen` is the term (campaign length, seconds). */
   function setManifestTx(mint: PublicKey, termLen: BN, o: ManifestOpts = {}) {
     const aud = o.auditor ?? auditor.publicKey;
+    const signer = o.issuer ?? issuer;
     return program.methods
       .setManifest(
-        RETURN_RATE_BPS,
+        o.returnRateBps ?? RETURN_RATE_BPS,
         o.toleranceBps ?? TOLERANCE_BPS,
-        LCL_BPS,
-        FLOOR_BPS,
+        o.shortfallToleranceBps ?? LCL_BPS,
+        o.floorBps ?? FLOOR_BPS,
         new BN(o.periodLen ?? PERIOD_LEN),
         termLen,
         o.sampleSize ?? SAMPLE,
         o.maxDefects ?? 0,
+        o.planHash ?? PLAN_HASH,
       )
       .accounts({
-        issuer: issuer.publicKey,
+        issuer: signer.publicKey,
         tokenState: client.pdas.tokenState(mint)[0],
         manifest: client.pdas.manifest(mint)[0],
         auditor: aud,
@@ -459,16 +638,34 @@ describe("torus-protocol lifecycle", () => {
         config: client.pdas.config()[0],
         systemProgram: SystemProgram.programId,
       })
+      .signers(signer === issuer ? [] : [signer])
       .rpc();
   }
 
-  /** Terms the operator sets per company (bond target, minimum conversion price). */
-  function setTermsTx(mint: PublicKey, signer: Keypair = authority, bondTarget = BOND_TARGET, minPrice = MIN_PRICE) {
-    return program.methods
-      .setIssuerTerms(bondTarget, minPrice)
-      .accounts({ authority: signer.publicKey, config: client.pdas.config()[0], tokenState: client.pdas.tokenState(mint)[0] })
+  /**
+   * Terms the operator sets per company (bond target, minimum conversion price, share per rank, local partner).
+   * Once they are set, the company's tax accountant is registered too.
+   */
+  async function setTermsTx(
+    mint: PublicKey,
+    signer: Keypair = authority,
+    bondTarget = BOND_TARGET,
+    minPrice = MIN_PRICE,
+    tiers = TIER_SHARES,
+    lp = localPartner.publicKey,
+  ) {
+    const sig = await program.methods
+      .setIssuerTerms(bondTarget, minPrice, tiers)
+      .accounts({
+        authority: signer.publicKey,
+        config: client.pdas.config()[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        localPartnerRecord: client.pdas.localPartner(lp)[0],
+      })
       .signers(signer === authority ? [] : [signer])
       .rpc();
+    await ensureTaxAccountant(mint);
+    return sig;
   }
 
   function depositTx(mint: PublicKey, amount: number) {
@@ -487,11 +684,11 @@ describe("torus-protocol lifecycle", () => {
   }
 
   /** mint → issue → manifest → operator terms → deposit (bond + redemption pool) → metering starts. */
-  async function setupToken(m: ManifestOpts & { maxFee?: number } = {}): Promise<PublicKey> {
-    const mint = await createTorusMint({ maxFee: m.maxFee });
-    await issueTokenTx(mint, issuer, FEE_BPS, m.maxFee ?? MAX_FEE);
-    await setManifestTx(mint, TERM_LEN, m);
-    await setTermsTx(mint);
+  async function setupToken(m: ManifestOpts & { maxFee?: number; termLen?: BN; tiers?: number[] } = {}): Promise<PublicKey> {
+    const mint = await createTorusMint({ maxFee: m.maxFee, mintAuthority: m.issuer });
+    await issueTokenTx(mint, m.issuer ?? issuer, FEE_BPS, m.maxFee ?? MAX_FEE);
+    await setManifestTx(mint, m.termLen ?? TERM_LEN, m);
+    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, m.tiers ?? TIER_SHARES);
     await depositTx(mint, DEPOSIT);
     // The bond is full, so the first provision sets the metering baseline (redemptions start; earlier volume is not counted).
     await provision(mint);
@@ -519,17 +716,18 @@ describe("torus-protocol lifecycle", () => {
     return client.pdas.auditorRecord(m.auditor)[0];
   }
 
-  async function commitTx(mint: PublicKey, periodId: BN, tree: SumTree, controlTotal: number) {
+  async function commitTx(mint: PublicKey, periodId: BN, tree: SumTree, controlTotal: number, signer: Keypair = issuer) {
     return program.methods
       .commitPerformance(tree.commitmentArray(), new BN(controlTotal), tree.populationSize)
       .accounts({
-        issuer: issuer.publicKey,
+        issuer: signer.publicKey,
         tokenState: client.pdas.tokenState(mint)[0],
         manifest: client.pdas.manifest(mint)[0],
         auditorRecord: await manifestAuditorRecord(mint),
         audit: client.pdas.audit(mint, periodId)[0],
         systemProgram: SystemProgram.programId,
       })
+      .signers(signer === issuer ? [] : [signer])
       .rpc();
   }
 
@@ -634,6 +832,7 @@ describe("torus-protocol lifecycle", () => {
         tokenState: client.pdas.tokenState(mint)[0],
         manifest: client.pdas.manifest(mint)[0],
         audit: client.pdas.audit(mint, periodId)[0],
+        taxReport: client.pdas.taxReport(mint, periodId)[0],
         poolAuthority: client.pdas.poolAuthority(mint)[0],
         slashingBond: client.pdas.slashingBond(mint)[0],
         issuerEscrow: client.pdas.issuerEscrow(mint)[0],
@@ -820,7 +1019,6 @@ describe("torus-protocol lifecycle", () => {
 
     const src = await createAssociatedTokenAccountIdempotent(connection, authority, mint, authority.publicKey, undefined, TOKEN_2022_PROGRAM_ID);
     const selfDst = await createAccount(connection, authority, mint, authority.publicKey, Keypair.generate(), undefined, TOKEN_2022_PROGRAM_ID);
-    await mintToChecked(connection, authority, mint, src, authority, AMT * 4, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID);
 
     const before: any = await hook.account.volumeCounter.fetch(volumePda);
 
@@ -908,24 +1106,31 @@ describe("torus-protocol lifecycle", () => {
     assert.equal(afterFix.periodId.toNumber(), stuck.periodId.toNumber() + 1, "the period advances");
   });
 
-  it("(i) no commitment under an expired manifest (campaigns)", async () => {
-    const mint = await setupToken();
-    const { periodId, budget } = await accrueAndProvision(mint);
-    const tree = buildTree(budget);
+  it("(i) after the manifest expires a period gets no obligation, so nothing can be committed; a new campaign brings it back", async () => {
+    const mint = await setupToken({ termLen: new BN(4) });
+    const m: any = await program.account.manifest.fetch(client.pdas.manifest(mint)[0]);
+    const validUntil = (m.validUntil as BN).toNumber();
+    await waitChainTime(validUntil);
+    await waitNextBoundary(mint);
 
-    // --- Switch to a 1-second campaign and wait for it to expire ---
-    await setManifestTx(mint, new BN(1));
-    const shortManifest: any = await program.account.manifest.fetch(client.pdas.manifest(mint)[0]);
-    const validUntil = (shortManifest.validUntil as BN).toNumber();
-    await waitChainTime(validUntil + 1);
+    // Volume in a period that started after the term: it closes with no obligation, so there is nothing to commit to
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    const k = await lastTransferPeriod(mint);
+    assert.isAbove(await periodStart(mint, k), validUntil, "the volume fell after the term");
+    const budgets = await closeThrough(mint, k);
+    assert.isNotEmpty(budgets, "the period with the volume was closed here");
+    assert.deepEqual(budgets, budgets.map(() => 0), "no obligation under an expired manifest");
+    const ts: any = await tokenState(mint);
+    const none = await failure(commitTx(mint, ts.periodId, buildTree(OBLIGATION), OBLIGATION));
+    assert.match(none ?? "", /BudgetNotProvisioned/, "nothing to commit to");
 
-    const expired = await failure(commitTx(mint, periodId, tree, budget));
-    assert.isNotNull(expired, "a commitment under an expired manifest must be rejected");
-    assert.match(expired!, /ManifestExpired/, "rejected because the term expired");
-
-    // --- Control: a new campaign allows committing again ---
+    // Control: a new campaign; a period that starts after it has an obligation again and can be committed
     await setManifestTx(mint, TERM_LEN);
-    assert.isNull(await failure(commitTx(mint, periodId, tree, budget)), "committing works under the new campaign");
+    await waitNextBoundary(mint);
+    const { periodId, budget } = await accrueAndProvision(mint);
+    assert.equal(budget, OBLIGATION, "obligations are back under the new campaign");
+    assert.isNull(await failure(commitTx(mint, periodId, buildTree(budget), budget)), "committing works under the new campaign");
   });
 
   // ---------------------------------------------------------------- fixed holes
@@ -1125,7 +1330,6 @@ describe("torus-protocol lifecycle", () => {
   it("(r) delegated transfers go through the hook and count as volume", async () => {
     const mint = await setupToken();
     const src = await createAssociatedTokenAccountIdempotent(connection, authority, mint, authority.publicKey, undefined, TOKEN_2022_PROGRAM_ID);
-    await mintToChecked(connection, authority, mint, src, authority, VOLUME, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID);
     const delegate = Keypair.generate();
     await approveChecked(connection, authority, mint, src, delegate.publicKey, authority, VOLUME, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID);
     const dst = await createAssociatedTokenAccountIdempotent(connection, authority, mint, Keypair.generate().publicKey, undefined, TOKEN_2022_PROGRAM_ID);
@@ -1204,21 +1408,6 @@ describe("torus-protocol lifecycle", () => {
     return sendAndConfirmTransaction(connection, tx, [authority, who]);
   }
 
-  function claimTx(mint: PublicKey, to: PublicKey) {
-    return program.methods
-      .claimDistribution()
-      .accounts({
-        crank: authority.publicKey,
-        tokenState: client.pdas.tokenState(mint)[0],
-        poolAuthority: client.pdas.poolAuthority(mint)[0],
-        issuerEscrow: client.pdas.issuerEscrow(mint)[0],
-        issuerUsdc: to,
-        usdcMint,
-        usdcTokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
-  }
-
   /** A token funded by fees only: issue → manifest → operator terms (no deposit) → volume → harvest (20_000 in fees). */
   async function setupFeeFunded(): Promise<PublicKey> {
     const mint = await createTorusMint();
@@ -1263,9 +1452,9 @@ describe("torus-protocol lifecycle", () => {
   }
 
   /** For the provisioned period: commit → uniqueness → sample → proofs → observation → finalize. */
-  async function auditPeriod(mint: PublicKey, periodId: BN, controlTotal: number, scenario: "pass" | "attackX") {
+  async function auditPeriod(mint: PublicKey, periodId: BN, controlTotal: number, scenario: "pass" | "attackX", signer: Keypair = issuer) {
     const tree = buildTree(controlTotal);
-    await commitTx(mint, periodId, tree, controlTotal);
+    await commitTx(mint, periodId, tree, controlTotal, signer);
     await verifyUniqueness(mint, periodId, tree);
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
@@ -1316,26 +1505,20 @@ describe("torus-protocol lifecycle", () => {
     await convertTx(mint, 10_000, 5_000_000);
     assert.equal(await balance(vault), OBLIGATION, "3. the pool is filled up to the obligation (the budget the period's volume will create)");
     assert.equal(await balance(escrow), 600_000, "all of it fills the pool; the escrow does not grow");
-    assert.match((await failure(claimTx(mint, depositorUsdc))) ?? "", /NothingToClaim/, "the current period's share cannot be claimed yet");
+    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber(), 0, "the current period's share is not released yet");
 
     const p = await provisionUntilBudget(mint);
     const ts3: any = await program.account.tokenState.fetch(tsPda);
     assert.equal(p.budget, OBLIGATION, "budget = period 1 volume × return rate");
     assert.equal((ts3.reserved as BN).toNumber(), OBLIGATION, "the obligation is reserved in the pool");
     assert.equal((ts3.issuerPending as BN).toNumber(), 600_000, "the share from the closed period waits for this audit");
-    assert.match((await failure(claimTx(mint, depositorUsdc))) ?? "", /NothingToClaim/, "not claimable before the audit is final");
+    assert.equal((ts3.issuerClaimable as BN).toNumber(), 0, "not released before the audit is final");
 
-    // Audit (pass) → claimable
+    // Audit (pass) → released inside the escrow (spent only through approved withdrawal requests, see (ak)-(ao))
     const tree = await auditPeriod(mint, ts3.periodId, OBLIGATION, "pass");
     const ts4: any = await program.account.tokenState.fetch(tsPda);
-    assert.equal((ts4.issuerClaimable as BN).toNumber(), 600_000, "claimable after a clean result");
-
-    const other = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
-    assert.match((await failure(claimTx(mint, other))) ?? "", /Unauthorized/, "not paid to an account the issuer does not own");
-    const before = await balance(depositorUsdc);
-    await claimTx(mint, depositorUsdc);
-    assert.equal((await balance(depositorUsdc)) - before, 600_000, "the issuer receives its share");
-    assert.equal(await balance(escrow), 0, "the escrow is empty");
+    assert.equal((ts4.issuerClaimable as BN).toNumber(), 600_000, "released after a clean result");
+    assert.equal(await balance(escrow), 600_000, "the released share stays in the escrow");
 
     // Payouts reduce the reservation
     await confirmLeaf(mint, ts3.periodId, tree, 0);
@@ -1354,7 +1537,12 @@ describe("torus-protocol lifecycle", () => {
 
     // No deposit or conversion while the terms are unset (redemptions cannot start with a zero bond)
     assert.match((await failure(depositTx(mint, DEPOSIT))) ?? "", /IssuerTermsNotSet/, "no deposit without a bond target");
-    assert.match((await failure(convertTx(mint, 10_000, 3_000_000))) ?? "", /IssuerTermsNotSet/, "no conversion without terms");
+    // (without terms there is no local partner either, so its record is missing)
+    assert.match(
+      (await failure(convertTx(mint, 10_000, 3_000_000))) ?? "",
+      /IssuerTermsNotSet|AccountNotInitialized/,
+      "no conversion without terms",
+    );
 
     // Only the operator sets terms; the bond target must be at least the minimum fixed at initialize
     const outsider = Keypair.generate();
@@ -1393,7 +1581,6 @@ describe("torus-protocol lifecycle", () => {
     assert.equal((await balance(slashDestAta)) - slashBefore, BOND_TARGET.toNumber() + 600_000, "both the bond and the issuer share are slashed");
     const after: any = await tokenState(mint);
     assert.equal((after.issuerPending as BN).toNumber() + (after.issuerClaimable as BN).toNumber(), 0, "nothing left to claim");
-    assert.match((await failure(claimTx(mint, depositorUsdc))) ?? "", /TokenFrozen/, "no distribution after a freeze");
   });
 
   function replaceAuditorTx(mint: PublicKey, periodId: BN, currentAuditor: PublicKey, newAuditor: PublicKey, signer: Keypair = authority) {
@@ -1488,7 +1675,7 @@ describe("torus-protocol lifecycle", () => {
       .rpc();
   }
 
-  async function finalizeExitTx(mint: PublicKey, issuerUsdc: PublicKey) {
+  async function finalizeExitTx(mint: PublicKey) {
     const ts: any = await tokenState(mint);
     const pid: BN = ts.periodId;
     const audit = pid.gtn(0) && (ts.budget as BN).gtn(0) ? client.pdas.audit(mint, pid)[0] : null;
@@ -1496,7 +1683,6 @@ describe("torus-protocol lifecycle", () => {
       crank: authority.publicKey,
       mint,
       audit,
-      issuerUsdc,
       treasury: treasuryAta,
       usdcMint,
       usdcTokenProgram: TOKEN_PROGRAM_ID,
@@ -1548,7 +1734,7 @@ describe("torus-protocol lifecycle", () => {
     assert.equal(ts3.periodId.toNumber(), ts2.periodId.toNumber() + 1, "moved to the next period");
   });
 
-  it("(z) voluntary exit: obligation through the requested period; half the bond back after its audit; fees after exit; liquidation", async () => {
+  it("(z) voluntary exit: obligation through the requested period; after its audit half the bond to customers; fees after exit; liquidation", async () => {
     // A longer period so the request and the volume fall in the same period.
     const mint = await setupToken({ periodLen: 20 });
     const tsPda = client.pdas.tokenState(mint)[0];
@@ -1563,12 +1749,12 @@ describe("torus-protocol lifecycle", () => {
     const r = ((await tokenState(mint)).exitRequestPeriod as BN).toNumber();
 
     // The exit cannot finalize until the volume up to the requested period is provisioned and audited (no escaping the obligation)
-    assert.match((await failure(finalizeExitTx(mint, depositorUsdc))) ?? "", /ExitNotReady/, "not before the provision");
+    assert.match((await failure(finalizeExitTx(mint))) ?? "", /ExitNotReady/, "not before the provision");
     const p = await provisionUntilBudget(mint);
     assert.equal(p.budget, OBLIGATION, "volume up to the requested period becomes an obligation");
     const tree = buildTree(p.budget);
     await commitTx(mint, p.periodId, tree, p.budget);
-    assert.match((await failure(finalizeExitTx(mint, depositorUsdc))) ?? "", /ExitNotReady/, "not before the audit is final");
+    assert.match((await failure(finalizeExitTx(mint))) ?? "", /ExitNotReady/, "not before the audit is final");
     await verifyUniqueness(mint, p.periodId, tree);
     await waitAfterCommit(mint, p.periodId);
     await designateTx(mint, p.periodId);
@@ -1586,13 +1772,11 @@ describe("torus-protocol lifecycle", () => {
     const bondPda = client.pdas.slashingBond(mint)[0];
     const bond = await balance(bondPda);
     assert.equal(bond, BOND_TARGET.toNumber(), "bond before the exit");
-    const other = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
-    assert.match((await failure(finalizeExitTx(mint, other))) ?? "", /Unauthorized/, "not refunded to an account the issuer does not own");
 
-    const issuerBefore = await balance(depositorUsdc);
+    const vaultBeforeExit = await balance(client.pdas.redemptionVault(mint)[0]);
     const treasuryBefore = await balance(treasuryAta);
-    await finalizeExitTx(mint, depositorUsdc);
-    assert.equal((await balance(depositorUsdc)) - issuerBefore, bond / 2, "half the bond to the issuer");
+    await finalizeExitTx(mint);
+    assert.equal((await balance(client.pdas.redemptionVault(mint)[0])) - vaultBeforeExit, bond / 2, "the issuer's half of the bond goes to customers (redemption pool)");
     assert.equal((await balance(treasuryAta)) - treasuryBefore, bond - bond / 2, "the rest to the operator treasury");
     assert.equal(await balance(bondPda), 0, "the bond is empty");
     assert.equal((await tokenState(mint)).exited, true, "exit finalized");
@@ -1601,14 +1785,13 @@ describe("torus-protocol lifecycle", () => {
     assert.match((await failure(provision(mint))) ?? "", /TokenExited/, "no provisioning after the exit");
     assert.match((await failure(depositTx(mint, 1_000))) ?? "", /TokenExited/, "no deposits after the exit");
 
-    // Fees after the exit: no obligation, so they split into operator and issuer shares and the issuer's is claimable at once
-    const claimableBefore = ((await tokenState(mint)).issuerClaimable as BN).toNumber();
+    // Fees after the exit: no obligation; the operator's share as before, the issuer's share goes to customers (the pool)
     const treasuryMid = await balance(treasuryAta);
     const vaultBeforeConvert = await balance(client.pdas.redemptionVault(mint)[0]);
     await convertTx(mint, 10_000, 5_000_000);
-    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber() - claimableBefore, 1_000_000, "the issuer share (20%) becomes claimable");
     assert.equal((await balance(treasuryAta)) - treasuryMid, 4_000_000, "operator share");
-    assert.equal(await balance(client.pdas.redemptionVault(mint)[0]), vaultBeforeConvert, "fees after the exit do not go into the pool");
+    assert.equal((await balance(client.pdas.redemptionVault(mint)[0])) - vaultBeforeConvert, 1_000_000, "the issuer share (20%) goes to the pool");
+    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber(), 0, "nothing becomes the issuer's");
 
     // Recipients can still claim after the exit
     await confirmLeaf(mint, p.periodId, tree, 0);
@@ -1629,7 +1812,7 @@ describe("torus-protocol lifecycle", () => {
     await claimLiquidationTx(mint, p.periodId, tree, 1, ben1);
     const expected = Math.floor((pool * Number(tree.valueAt(1))) / p.budget);
     assert.equal(await balance(ben1), expected, "split pro rata to the confirmed amount");
-    assert.match((await failure(claimLiquidationTx(mint, p.periodId, tree, 1, ben1))) ?? "", /already in use/, "a liquidation share is paid once");
+    assert.match((await failure(claimLiquidationTx(mint, p.periodId, tree, 1, ben1))) ?? "", /NothingToPay/, "a liquidation share is not paid twice");
 
     // A token frozen for a violation (forced exit) cannot recover its bond through a voluntary exit (already slashed)
     assert.isNotNull(frozenMint, "needs the token frozen in (b)");
@@ -1878,5 +2061,1285 @@ describe("torus-protocol lifecycle", () => {
     // Re-fixing the manifest with an active auditor resumes (control).
     await setManifestTx(mint, TERM_LEN, { auditor: a4.publicKey });
     await commitTx(mint, next.periodId, tree2, next.budget);
+  });
+
+  // ---------------------------------------------------------------- end of a manifest and the next one
+
+  /** Grid index of the period of the latest transfer (the hook records it at the first transfer after a boundary). */
+  async function lastTransferPeriod(mint: PublicKey): Promise<number> {
+    return ((await hook.account.volumeCounter.fetch(client.pdas.volumeCounter(mint)[0])) as any).lastSnapIdx.toNumber();
+  }
+
+  /** Start of grid period k (t0 + kΔ). */
+  async function periodStart(mint: PublicKey, k: number): Promise<number> {
+    const ts: any = await tokenState(mint);
+    return (ts.gridStartTs as BN).toNumber() + k * (ts.gridPeriodLen as BN).toNumber();
+  }
+
+  /** Closes periods until grid period k is closed, returning each closed period's budget (none of them may need an audit). */
+  async function closeThrough(mint: PublicKey, k: number): Promise<number[]> {
+    const budgets: number[] = [];
+    while (((await tokenState(mint)).periodId as BN).toNumber() <= k) {
+      await waitPeriod(mint);
+      await provision(mint);
+      budgets.push(((await tokenState(mint)).budget as BN).toNumber());
+    }
+    return budgets;
+  }
+
+  /** Closes every period that has ended (none of them may need an audit). */
+  async function catchUp(mint: PublicKey): Promise<number[]> {
+    const ts: any = await tokenState(mint);
+    const t0 = (ts.gridStartTs as BN).toNumber();
+    const len = (ts.gridPeriodLen as BN).toNumber();
+    return closeThrough(mint, Math.floor(((await chainTime()) - t0) / len) - 1);
+  }
+
+  /** Waits until the next period boundary has passed. */
+  async function waitNextBoundary(mint: PublicKey) {
+    const ts: any = await tokenState(mint);
+    const t0 = (ts.gridStartTs as BN).toNumber();
+    const len = (ts.gridPeriodLen as BN).toNumber();
+    await waitChainTime(t0 + (Math.floor(((await chainTime()) - t0) / len) + 1) * len);
+  }
+
+  async function manifestOf(mint: PublicKey): Promise<any> {
+    return program.account.manifest.fetch(client.pdas.manifest(mint)[0]);
+  }
+
+  it("(ag) after the term ends, a period that started during the campaign is still audited from commitment to finalization", async () => {
+    // A campaign that ends shortly after the first period closes (the period is 20 s, the term 26 s).
+    const mint = await setupToken({ periodLen: 20, termLen: new BN(26) });
+    const validUntil = ((await manifestOf(mint)).validUntil as BN).toNumber();
+    const { periodId, budget } = await accrueAndProvision(mint);
+    assert.equal(budget, OBLIGATION, "the period's obligation");
+    assert.isAtMost(await periodStart(mint, periodId.toNumber() - 1), validUntil, "the audited period started during the campaign");
+
+    // Commit after the term (and before the audit deadline)
+    await waitChainTime(validUntil);
+    const ts: any = await tokenState(mint);
+    assert.isBelow(await chainTime(), (ts.auditDeadline as BN).toNumber(), "still before the audit deadline");
+    const bond = await balance(client.pdas.slashingBond(mint)[0]);
+    const tree = buildTree(budget);
+    assert.isNull(await failure(commitTx(mint, periodId, tree, budget)), "the commitment is accepted after the term");
+    await verifyUniqueness(mint, periodId, tree);
+    await waitAfterCommit(mint, periodId);
+    await designateTx(mint, periodId);
+    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId));
+    await observe(mint, periodId, auditor);
+    await finalizeTx(mint, periodId);
+
+    const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
+    assert.equal(audit.result, 1, "Pass");
+    const after: any = await tokenState(mint);
+    assert.equal(after.frozen, false, "not frozen");
+    assert.equal(await balance(client.pdas.slashingBond(mint)[0]), bond, "nothing slashed");
+    await waitChainTime((after.auditDeadline as BN).toNumber());
+    assert.match((await failure(declareDefaultTx(mint, periodId))) ?? "", /DefaultNotDue/, "the expired campaign's audit is not a default");
+  });
+
+  it("(ah) between campaigns no obligation arises and no default can be declared; the carried shortfall waits for the exit's final audit", async () => {
+    // The first period is the campaign's last one: the term ends before the second period starts (period 20 s, term 18 s).
+    // (A later campaign period would take the carry into its own obligation, as in (c).)
+    const mint = await setupToken({ periodLen: 20, termLen: new BN(18) });
+    const validUntil = ((await manifestOf(mint)).validUntil as BN).toNumber();
+
+    // Last campaign period: an honest shortfall (5% short, within the 10% band) is carried
+    const a = await accrueAndProvision(mint);
+    assert.isAbove(await periodStart(mint, a.periodId.toNumber()), validUntil, "the next period starts after the term");
+    const short = a.budget / 20;
+    await auditPeriod(mint, a.periodId, a.budget - short, "pass");
+    const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, a.periodId)[0]);
+    assert.equal(audit.result, 4, "HonestShortfall");
+    assert.equal(((await tokenState(mint)).unfulfilled as BN).toNumber(), short, "the shortfall is carried");
+
+    // The gap: volume in a period that started after the term, with no next manifest
+    await waitChainTime(validUntil);
+    await waitNextBoundary(mint);
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    const k = await lastTransferPeriod(mint);
+    assert.isAbove(await periodStart(mint, k), validUntil, "the volume fell in the gap");
+    const budgets = await closeThrough(mint, k);
+    assert.isNotEmpty(budgets, "the period with the volume was closed here");
+    assert.deepEqual(budgets, budgets.map(() => 0), "no new obligation in the gap (its volume is not counted)");
+    const gap: any = await tokenState(mint);
+    assert.equal((gap.unfulfilled as BN).toNumber(), short, "the carry is kept");
+    assert.match((await failure(commitTx(mint, gap.periodId, buildTree(OBLIGATION), OBLIGATION))) ?? "", /BudgetNotProvisioned/, "nothing to commit to");
+    await waitChainTime((gap.auditDeadline as BN).toNumber());
+    assert.match((await failure(declareDefaultTx(mint, gap.periodId))) ?? "", /DefaultNotDue/, "no default in the gap");
+
+    // An exit during the gap: its final audit settles the carry (the gap's volume still does not count)
+    await requestExitTx(mint);
+    const r = ((await tokenState(mint)).exitRequestPeriod as BN).toNumber();
+    const fin = await provisionUntilBudget(mint);
+    assert.equal(fin.periodId.toNumber(), r + 1, "the exit's last period");
+    assert.equal(fin.budget, short, "its obligation is the carry alone");
+    await auditPeriod(mint, fin.periodId, short, "pass");
+    assert.equal(((await tokenState(mint)).unfulfilled as BN).toNumber(), 0, "the carry is settled");
+    await finalizeExitTx(mint);
+    assert.equal((await tokenState(mint)).exited, true, "exit finalized");
+  });
+
+  it("(ai) a manifest change does not touch periods that started before it; gap volume does not count; tier, streak, bond and used IDs carry over", async () => {
+    const LEN = 6;
+    const mint = await setupToken({ periodLen: LEN, termLen: new BN(30) });
+
+    // Campaign A: volume, then the issuer raises the rate to 60% and the sample to 6 (allowed during a campaign) before
+    // the period closes
+    const v1 = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [v1.dst]);
+    const k1 = await lastTransferPeriod(mint);
+    await setManifestTx(mint, new BN(30), { periodLen: LEN, returnRateBps: 6_000, sampleSize: 6 });
+    const raisedAt = ((await manifestOf(mint)).validFrom as BN).toNumber();
+    assert.isBelow(await periodStart(mint, k1), raisedAt, "the volume's period started before the raise");
+    const a = await provisionUntilBudget(mint);
+    assert.equal(a.budget, OBLIGATION, "that period keeps the rate in force when it started (50%, not 60%)");
+    const treeA = await auditPeriod(mint, a.periodId, a.budget, "pass");
+    const auditA: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, a.periodId)[0]);
+    assert.equal(auditA.sampleSize, SAMPLE, "and its audit is judged with the sample size in force when it started");
+    const before: any = await tokenState(mint);
+    const bondPda = client.pdas.slashingBond(mint)[0];
+    const bond = await balance(bondPda);
+
+    // The gap, then campaign B with a lower rate (30%), fixed in a period that started in the gap; volume follows in that period
+    const validUntilA = ((await manifestOf(mint)).validUntil as BN).toNumber();
+    await waitChainTime(validUntilA);
+    await catchUp(mint);
+    await waitNextBoundary(mint);
+    await setManifestTx(mint, TERM_LEN, { periodLen: LEN, returnRateBps: 3_000 });
+    const validFromB = ((await manifestOf(mint)).validFrom as BN).toNumber();
+    const g = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [g.dst]);
+    const kg = await lastTransferPeriod(mint);
+    assert.isAbove(await periodStart(mint, kg), validUntilA, "the transfer's period started after A's term");
+    assert.isBelow(await periodStart(mint, kg), validFromB, "and before B");
+    const gapBudgets = await closeThrough(mint, kg);
+    assert.isNotEmpty(gapBudgets, "the period with the volume was closed here");
+    assert.deepEqual(gapBudgets, gapBudgets.map(() => 0), "B adds no obligation to a period that started before it");
+
+    // Carried over
+    const after: any = await tokenState(mint);
+    assert.equal(before.consecutivePasses, 1, "one pass under A");
+    assert.equal(after.tier, before.tier, "tier carried over");
+    assert.equal(after.consecutivePasses, before.consecutivePasses, "streak carried over");
+    assert.equal(await balance(bondPda), bond, "bond carried over");
+
+    // Campaign B: a period that starts after it uses B's rate; a payment ID recognized under A cannot be used again
+    await depositTx(mint, OBLIGATION);
+    const b = await accrueAndProvision(mint);
+    assert.equal(b.budget, (VOLUME * 3_000) / BPS, "B's rate applies to periods that start after it");
+    const reuse = buildTree(b.budget, POP, [Buffer.from(treeA.outcomeAt(0)), ...Array.from({ length: POP - 1 }, () => newOutcome())]);
+    await commitTx(mint, b.periodId, reuse, b.budget);
+    assert.match((await failure(verifyUniqueness(mint, b.periodId, reuse))) ?? "", /OutcomeAlreadyUsed/, "used payment IDs carry over");
+  });
+
+  it("(aj) during a campaign the manifest cannot change in the issuer's favor; a new auditor, a higher rate and a longer term are allowed", async () => {
+    // A long period, so no boundary falls between the changes.
+    const base = { periodLen: 60, sampleSize: 6 };
+    const mint = await setupToken(base);
+    const favor: [ManifestOpts, string][] = [
+      [{ returnRateBps: RETURN_RATE_BPS - 1 }, "a lower return rate"],
+      [{ toleranceBps: TOLERANCE_BPS + 1 }, "a wider tolerance"],
+      [{ shortfallToleranceBps: LCL_BPS + 1 }, "a wider shortfall tolerance"],
+      [{ sampleSize: 5 }, "a smaller sample"],
+      [{ maxDefects: 1 }, "more allowed defects"],
+      [{ planHash: Array(32).fill(1) }, "another use plan"],
+    ];
+    for (const [o, label] of favor) {
+      assert.match((await failure(setManifestTx(mint, TERM_LEN, { ...base, ...o }))) ?? "", /ManifestChangeFavorsIssuer/, `${label} is rejected`);
+    }
+    assert.match((await failure(setManifestTx(mint, new BN(86_400), base))) ?? "", /ManifestChangeFavorsIssuer/, "a shorter term is rejected");
+
+    const before: any = await manifestOf(mint);
+    await setManifestTx(mint, TERM_LEN.addn(86_400), { ...base, auditor: auditor2.publicKey, returnRateBps: RETURN_RATE_BPS + 1_000 });
+    const after: any = await manifestOf(mint);
+    assert.equal(after.auditor.toBase58(), auditor2.publicKey.toBase58(), "another registered auditor");
+    assert.equal(after.returnRateBps, RETURN_RATE_BPS + 1_000, "a higher return rate");
+    assert.isAbove((after.validUntil as BN).toNumber(), (before.validUntil as BN).toNumber(), "a longer term");
+    assert.isNull(
+      await failure(
+        setManifestTx(mint, TERM_LEN.addn(2 * 86_400), {
+          ...base,
+          auditor: auditor2.publicKey,
+          returnRateBps: RETURN_RATE_BPS + 1_000,
+          toleranceBps: TOLERANCE_BPS - 100,
+          sampleSize: 8,
+        }),
+      ),
+      "stricter judging is allowed too",
+    );
+
+    // A second change after a boundary that has not been closed would lose the terms an open period still needs
+    const quick = await setupToken({ periodLen: 3 });
+    // (a change in the same second as the period start applies to that period, so make the first one strictly later)
+    await waitChainTime(((await tokenState(quick)).periodStartTs as BN).toNumber());
+    await setManifestTx(quick, TERM_LEN, { periodLen: 3, returnRateBps: RETURN_RATE_BPS + 500 });
+    await waitNextBoundary(quick);
+    const raise = () => setManifestTx(quick, TERM_LEN, { periodLen: 3, returnRateBps: RETURN_RATE_BPS + 1_000 });
+    assert.match((await failure(raise())) ?? "", /PeriodsNotClosed/, "close the elapsed periods first");
+    await catchUp(quick);
+    assert.isNull(await failure(raise()), "after closing them the change goes through");
+  });
+
+  // ---------------------------------------------------------------- the issuer escrow
+
+  /** Sends one instruction, paid by the operator's wallet and signed by `signers`. */
+  async function sendIx(ix: any, ...signers: Keypair[]) {
+    const all = [authority, ...signers].filter((k, i, a) => a.findIndex((x) => x.publicKey.equals(k.publicKey)) === i);
+    return sendAndConfirmTransaction(connection, new Transaction().add(ix), all);
+  }
+
+  function registerPartnerTx(p: PublicKey) {
+    return program.methods
+      .registerPartner()
+      .accounts({
+        authority: authority.publicKey,
+        config: client.pdas.config()[0],
+        partner: p,
+        partnerRecord: client.pdas.partnerRecord(p)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+  }
+
+  function revokePartnerTx(signer: Keypair, p: PublicKey) {
+    return program.methods
+      .revokePartner()
+      .accounts({ authority: signer.publicKey, config: client.pdas.config()[0], partnerRecord: client.pdas.partnerRecord(p)[0] })
+      .signers(signer === authority ? [] : [signer])
+      .rpc();
+  }
+
+  async function setEscrowPartnerTx(mint: PublicKey, signer: Keypair, p: PublicKey, current?: PublicKey) {
+    return sendIx(await client.setEscrowPartner({ issuer: signer.publicKey, mint, partner: p, currentPartner: current ?? null }), signer);
+  }
+
+  const invoice = (s: string) => Array.from(keccak_256(Buffer.from(s)));
+
+  async function requestTx(mint: PublicKey, signer: Keypair, amount: number, payee: PublicKey, inv: number[], item = 1, fromBond = false) {
+    return sendIx(
+      await client.requestWithdrawal({ issuer: signer.publicKey, mint, planItem: item, amount: new BN(amount), payee, invoiceHash: inv, fromBond }),
+      signer,
+    );
+  }
+
+  async function approveTx(mint: PublicKey, signer: Keypair, inv: number[]) {
+    return sendIx(
+      await client.approveWithdrawal({ approver: signer.publicKey, mint, invoiceHash: inv, usdcMint, usdcTokenProgram: TOKEN_PROGRAM_ID }),
+      signer,
+    );
+  }
+
+  async function requestOf(mint: PublicKey, inv: number[]): Promise<any> {
+    return program.account.withdrawalRequest.fetch(client.pdas.withdrawal(mint, inv)[0]);
+  }
+
+  /** A token whose issuer has its own key (not the operator's), with a registered escrow partner. */
+  async function setupEscrowToken(m: ManifestOpts & { termLen?: BN } = {}) {
+    const iss = Keypair.generate();
+    await airdrop(iss.publicKey, 5);
+    const mint = await setupToken({ ...m, issuer: iss });
+    const p = Keypair.generate();
+    await registerPartnerTx(p.publicKey);
+    await setEscrowPartnerTx(mint, iss, p.publicKey);
+    return { iss, mint, p };
+  }
+
+  /** Volume → conversion (the issuer share, 1_000_000, goes to the escrow) → provision → clean audit (the share is released). */
+  async function fundAndRelease(mint: PublicKey, iss: Keypair) {
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    await convertTx(mint, 10_000, 5_000_000);
+    const p = await provisionUntilBudget(mint);
+    const tree = await auditPeriod(mint, p.periodId, p.budget, "pass", iss);
+    return { ...p, tree };
+  }
+
+  it("(ak) a clean audit releases the issuer share inside the escrow; nothing is paid to the issuer's account", async () => {
+    const names = (program.idl.instructions as any[]).map((ix) => String(ix.name));
+    assert.isFalse(names.some((n) => /^claim_?distribution$/i.test(n)), "no instruction pays the escrow out to the issuer");
+
+    const { iss, mint } = await setupEscrowToken();
+    const issuerUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, iss.publicKey);
+    await fundAndRelease(mint, iss);
+    const ts: any = await tokenState(mint);
+    assert.equal((ts.issuerClaimable as BN).toNumber(), 1_000_000, "the clean audit releases the issuer share");
+    assert.equal(await balance(client.pdas.issuerEscrow(mint)[0]), 1_000_000, "it stays in the escrow");
+    assert.equal(await balance(issuerUsdc), 0, "nothing reaches the issuer's account");
+  });
+
+  it("(al) one escrow partner per token, picked by the issuer from the registry; locked during the campaign unless revoked; separate keys", async () => {
+    const iss = Keypair.generate();
+    await airdrop(iss.publicKey, 5);
+    const mint = await setupToken({ issuer: iss });
+    const p1 = Keypair.generate();
+    const p2 = Keypair.generate();
+    for (const k of [p1.publicKey, p2.publicKey, iss.publicKey, auditor.publicKey, authority.publicKey]) await registerPartnerTx(k);
+    const outsider = Keypair.generate();
+    await airdrop(outsider.publicKey, 1);
+
+    assert.match((await failure(setEscrowPartnerTx(mint, outsider, p1.publicKey))) ?? "", /Unauthorized|ConstraintHasOne/, "only the issuer picks the partner");
+    assert.match(
+      (await failure(setEscrowPartnerTx(mint, iss, Keypair.generate().publicKey))) ?? "",
+      /AccountNotInitialized|PartnerNotRegistered/,
+      "the partner must be registered",
+    );
+    for (const [k, label] of [
+      [iss.publicKey, "the issuer"],
+      [auditor.publicKey, "the manifest's auditor"],
+      [authority.publicKey, "the operator"],
+    ] as [PublicKey, string][]) {
+      assert.match((await failure(setEscrowPartnerTx(mint, iss, k))) ?? "", /RolesNotSeparate/, `${label} cannot manage the escrow`);
+    }
+    await setEscrowPartnerTx(mint, iss, p1.publicKey);
+    assert.equal(((await tokenState(mint)).escrowPartner as PublicKey).toBase58(), p1.publicKey.toBase58(), "the token's escrow partner");
+
+    // The manifest cannot name the escrow partner as its auditor
+    await program.methods
+      .registerAuditor()
+      .accounts({
+        authority: authority.publicKey,
+        config: client.pdas.config()[0],
+        auditor: p1.publicKey,
+        auditorRecord: client.pdas.auditorRecord(p1.publicKey)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    assert.match(
+      (await failure(setManifestTx(mint, TERM_LEN, { issuer: iss, auditor: p1.publicKey }))) ?? "",
+      /RolesNotSeparate/,
+      "the auditor and the escrow partner are different keys",
+    );
+
+    // Locked during the campaign
+    assert.match((await failure(setEscrowPartnerTx(mint, iss, p2.publicKey))) ?? "", /EscrowPartnerLocked/, "no change during the campaign");
+
+    // The operator revokes partners (only the operator, once); a revoked partner cannot convert fees either
+    assert.match((await failure(revokePartnerTx(outsider, p1.publicKey))) ?? "", /Unauthorized|ConstraintHasOne/, "only the operator revokes");
+    await revokePartnerTx(authority, p1.publicKey);
+    assert.match((await failure(revokePartnerTx(authority, p1.publicKey))) ?? "", /PartnerRevoked/, "revoked once");
+    assert.match((await failure(convertTx(mint, 10_000, 10_000, p1))) ?? "", /PartnerNotRegistered/, "a revoked partner cannot convert");
+
+    // After the revocation the issuer moves to another registered partner (showing the revoked partner's record)
+    assert.match((await failure(setEscrowPartnerTx(mint, iss, p2.publicKey))) ?? "", /EscrowPartnerLocked/, "still locked without the revoked record");
+    await setEscrowPartnerTx(mint, iss, p2.publicKey, p1.publicKey);
+    assert.equal(((await tokenState(mint)).escrowPartner as PublicKey).toBase58(), p2.publicKey.toBase58(), "replaced after the revocation");
+    assert.match((await failure(setEscrowPartnerTx(mint, iss, p1.publicKey, p2.publicKey))) ?? "", /PartnerNotRegistered/, "a revoked partner cannot be picked");
+  });
+
+  it("(am) the manifest records the hash of the use plan", async () => {
+    const mint = await setupToken();
+    const m: any = await manifestOf(mint);
+    assert.deepEqual(Array.from(m.usePlanHash as number[]), PLAN_HASH, "the use plan's hash (its items and caps are an off-chain document)");
+  });
+
+  it("(an) withdrawal requests: a manifest in force with a use plan, within the released balance, never to the issuer, one per invoice", async () => {
+    const { iss, mint } = await setupEscrowToken();
+    await fundAndRelease(mint, iss);
+    const escrow = client.pdas.issuerEscrow(mint)[0];
+    const vendorUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
+    const issuerUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, iss.publicKey);
+    const outsider = Keypair.generate();
+    await airdrop(outsider.publicKey, 1);
+
+    assert.match((await failure(requestTx(mint, outsider, 100_000, vendorUsdc, invoice("an-0")))) ?? "", /Unauthorized|ConstraintHasOne/, "only the issuer requests");
+    assert.match((await failure(requestTx(mint, iss, 1_000_001, vendorUsdc, invoice("an-1")))) ?? "", /WithdrawalExceedsReleased/, "at most the released balance");
+    assert.match((await failure(requestTx(mint, iss, 100_000, issuerUsdc, invoice("an-2")))) ?? "", /PayeeIsIssuer/, "not to the issuer's own account");
+
+    await requestTx(mint, iss, 400_000, vendorUsdc, invoice("an-3"), 7);
+    const req = await requestOf(mint, invoice("an-3"));
+    assert.equal((req.amount as BN).toNumber(), 400_000, "amount");
+    assert.equal(req.planItem, 7, "item of the use plan");
+    assert.deepEqual(Array.from(req.planHash as number[]), PLAN_HASH, "the use plan in force");
+    assert.equal((req.payee as PublicKey).toBase58(), vendorUsdc.toBase58(), "payee");
+    assert.deepEqual(Array.from(req.invoiceHash as number[]), invoice("an-3"), "invoice hash");
+    assert.equal(req.executed, false, "not executed");
+    assert.match((await failure(requestTx(mint, iss, 100_000, vendorUsdc, invoice("an-3")))) ?? "", /already in use/, "an invoice is used once");
+    assert.equal(await balance(escrow), 1_000_000, "a request alone moves nothing");
+    assert.equal(await balance(vendorUsdc), 0, "nothing paid yet");
+
+    // No manifest in force: without a use plan, and after the term
+    const iss2 = Keypair.generate();
+    await airdrop(iss2.publicKey, 5);
+    const bare = await setupToken({ issuer: iss2, termLen: new BN(10), planHash: Array(32).fill(0) });
+    assert.match((await failure(requestTx(bare, iss2, 1, vendorUsdc, invoice("an-4")))) ?? "", /UsePlanNotSet/, "no request without a use plan");
+    await waitChainTime(((await manifestOf(bare)).validUntil as BN).toNumber());
+    assert.match((await failure(requestTx(bare, iss2, 1, vendorUsdc, invoice("an-5")))) ?? "", /ManifestExpired/, "no request after the term");
+  });
+
+  it("(ao) a request runs only with both the escrow partner's and the auditor's approval, straight from the escrow; never with one of them, the issuer or the operator", async () => {
+    const { iss, mint, p } = await setupEscrowToken();
+    await fundAndRelease(mint, iss);
+    const escrow = client.pdas.issuerEscrow(mint)[0];
+    const vendorUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
+    const outsider = Keypair.generate();
+
+    const inv1 = invoice("ao-1");
+    await requestTx(mint, iss, 400_000, vendorUsdc, inv1);
+    assert.match((await failure(approveTx(mint, authority, inv1))) ?? "", /NotAnApprover/, "the operator's key cannot approve");
+    assert.match((await failure(approveTx(mint, iss, inv1))) ?? "", /NotAnApprover/, "nor the issuer's");
+    assert.match((await failure(approveTx(mint, outsider, inv1))) ?? "", /NotAnApprover/, "nor anyone else's");
+
+    await approveTx(mint, p, inv1);
+    assert.equal(await balance(vendorUsdc), 0, "the partner's approval alone moves nothing");
+    assert.equal(await balance(escrow), 1_000_000, "the escrow is untouched");
+    assert.equal((await requestOf(mint, inv1)).executed, false, "not executed");
+    await approveTx(mint, p, inv1);
+    assert.equal(await balance(vendorUsdc), 0, "approving twice is still one approval");
+
+    await approveTx(mint, auditor, inv1);
+    assert.equal(await balance(vendorUsdc), 400_000, "with both approvals the payee is paid");
+    assert.equal(await balance(escrow), 600_000, "straight from the escrow");
+    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber(), 600_000, "the released balance drops");
+    assert.equal((await requestOf(mint, inv1)).executed, true, "executed");
+    assert.match((await failure(approveTx(mint, p, inv1))) ?? "", /WithdrawalAlreadyExecuted/, "a request runs once");
+
+    // The other order: the auditor's approval alone moves nothing either
+    const inv2 = invoice("ao-2");
+    await requestTx(mint, iss, 100_000, vendorUsdc, inv2);
+    await approveTx(mint, auditor, inv2);
+    assert.equal(await balance(vendorUsdc), 400_000, "the auditor's approval alone moves nothing");
+    await approveTx(mint, p, inv2);
+    assert.equal(await balance(vendorUsdc), 500_000, "paid once both have approved");
+
+    // Two requests each within the released balance but not together: the second cannot run
+    const inv3 = invoice("ao-3");
+    const inv4 = invoice("ao-4");
+    await requestTx(mint, iss, 500_000, vendorUsdc, inv3);
+    await requestTx(mint, iss, 500_000, vendorUsdc, inv4);
+    await approveTx(mint, p, inv3);
+    await approveTx(mint, auditor, inv3);
+    await approveTx(mint, p, inv4);
+    assert.match((await failure(approveTx(mint, auditor, inv4))) ?? "", /WithdrawalExceedsReleased/, "nothing beyond the released balance");
+    assert.equal(await balance(vendorUsdc), 1_000_000, "only the released balance was paid");
+    assert.equal(await balance(escrow), 0, "the escrow is spent down to zero");
+  });
+
+  it("(ap) fraud slashes everything left in the escrow, released or not, and pending requests cannot run", async () => {
+    const { iss, mint, p } = await setupEscrowToken();
+    await fundAndRelease(mint, iss);
+    const escrow = client.pdas.issuerEscrow(mint)[0];
+    const vendorUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
+
+    // Next period: another conversion (part fills the pool up to what is owed, the rest goes to the escrow) and a half-approved request
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    await convertTx(mint, 10_000, 5_000_000);
+    const inv = invoice("ap-1");
+    await requestTx(mint, iss, 300_000, vendorUsdc, inv);
+    await approveTx(mint, p, inv);
+    const next = await provisionUntilBudget(mint);
+    const ts: any = await tokenState(mint);
+    assert.equal((ts.issuerClaimable as BN).toNumber(), 1_000_000, "released share in the escrow");
+    assert.isAbove((ts.issuerPending as BN).toNumber(), 0, "and a share waiting for this audit");
+    const escrowBefore = await balance(escrow);
+    const bond = await balance(client.pdas.slashingBond(mint)[0]);
+    const slashBefore = await balance(slashDestAta);
+
+    await auditPeriod(mint, next.periodId, next.budget, "attackX", iss);
+    assert.equal(((await program.account.auditCycle.fetch(client.pdas.audit(mint, next.periodId)[0])) as any).result, 2, "FraudOverstatement");
+    assert.equal(await balance(escrow), 0, "the whole escrow is slashed");
+    assert.equal((await balance(slashDestAta)) - slashBefore, bond + escrowBefore, "bond and escrow (released and pending) go to the compensation pool");
+    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber(), 0, "nothing released remains");
+    assert.match((await failure(approveTx(mint, auditor, inv))) ?? "", /TokenFrozen/, "a pending request cannot run after fraud");
+    assert.equal(await balance(vendorUsdc), 0, "nothing was paid");
+  });
+
+  it("(aq) on exit the escrow's remainder and the issuer's half of the bond go to customers through liquidation, and so do later issuer shares", async () => {
+    const { iss, mint } = await setupEscrowToken({ periodLen: 20 });
+    const issuerUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, iss.publicKey);
+    const vault = client.pdas.redemptionVault(mint)[0];
+    const escrow = client.pdas.issuerEscrow(mint)[0];
+    const bondPda = client.pdas.slashingBond(mint)[0];
+
+    // Fill the escrow and request the exit in the same period; the final audit passes and releases the share
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    await convertTx(mint, 10_000, 5_000_000);
+    await requestExitTx(mint, iss);
+    const r = ((await tokenState(mint)).exitRequestPeriod as BN).toNumber();
+    const p = await provisionUntilBudget(mint);
+    const tree = await auditPeriod(mint, p.periodId, p.budget, "pass", iss);
+    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber(), 1_000_000, "released before the exit");
+    while (((await tokenState(mint)).periodId as BN).toNumber() <= r) {
+      await waitPeriod(mint);
+      await provision(mint);
+    }
+
+    const vault0 = await balance(vault);
+    const surplus0 = vault0 - ((await tokenState(mint)).reserved as BN).toNumber();
+    const bond = await balance(bondPda);
+    const treasury0 = await balance(treasuryAta);
+    await finalizeExitTx(mint);
+    assert.equal((await balance(vault)) - vault0, 1_000_000 + bond / 2, "the escrow's remainder and the issuer's half of the bond go to the redemption pool");
+    assert.equal((await balance(treasuryAta)) - treasury0, bond - bond / 2, "the operator's half is unchanged");
+    assert.equal(await balance(escrow), 0, "the escrow is empty");
+    assert.equal(((await tokenState(mint)).issuerClaimable as BN).toNumber(), 0, "nothing stays released for the issuer");
+
+    // An issuer share arriving after the exit goes to the pool as well
+    const vault1 = await balance(vault);
+    await convertTx(mint, 10_000, 5_000_000);
+    assert.equal((await balance(vault)) - vault1, 1_000_000, "the issuer share after the exit goes to the pool");
+    assert.equal(await balance(escrow), 0, "not to the escrow");
+
+    // Liquidation: all of it is split over the last clean audit's leaves
+    const pool = (await balance(vault)) - ((await tokenState(mint)).reserved as BN).toNumber();
+    assert.equal(pool, surplus0 + 1_000_000 + bond / 2 + 1_000_000, "the liquidation surplus includes them");
+    await startLiquidationTx(mint);
+    assert.equal(((await tokenState(mint)).liquidationPool as BN).toNumber(), pool, "liquidation pool");
+    await confirmLeaf(mint, p.periodId, tree, 1);
+    const ben1 = await createAssociatedTokenAccount(connection, authority, usdcMint, tree.beneficiaryAt(1));
+    await claimLiquidationTx(mint, p.periodId, tree, 1, ben1);
+    const v1 = Number(tree.valueAt(1));
+    assert.equal(await balance(ben1), Math.floor((pool * v1) / p.budget), "the customer's share, pro rata to the confirmed amount");
+
+    // Issuer shares arriving after liquidation started are added to the split
+    const more = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [more.dst]);
+    await convertTx(mint, 10_000, 5_000_000);
+    assert.equal(((await tokenState(mint)).liquidationPool as BN).toNumber(), pool + 1_000_000, "added to the liquidation pool");
+    await claimLiquidationTx(mint, p.periodId, tree, 1, ben1);
+    assert.equal(await balance(ben1), Math.floor(((pool + 1_000_000) * v1) / p.budget), "the same customer receives its share of the addition");
+    assert.equal(await balance(issuerUsdc), 0, "the issuer receives nothing at any point");
+  });
+
+  it("(ar) the company can request a payment from the bond: down to half its target, with both approvals, straight to the payee; redemptions go on and fees refill it", async () => {
+    const { iss, mint, p } = await setupEscrowToken();
+    const bondPda = client.pdas.slashingBond(mint)[0];
+    const vendorUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
+    const issuerUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, iss.publicKey);
+    const half = BOND_TARGET.toNumber() / 2;
+    assert.equal(await balance(bondPda), BOND_TARGET.toNumber(), "the bond is full");
+
+    // Up to half of the target, never to the issuer itself
+    assert.match((await failure(requestTx(mint, iss, half + 1, vendorUsdc, invoice("ar-0"), 3, true))) ?? "", /BondUseExceedsLimit/, "at most half of the bond target");
+    assert.match((await failure(requestTx(mint, iss, half, issuerUsdc, invoice("ar-1"), 3, true))) ?? "", /PayeeIsIssuer/, "not to the issuer's own account");
+    const inv = invoice("ar-2");
+    await requestTx(mint, iss, half, vendorUsdc, inv, 3, true);
+    assert.equal((await requestOf(mint, inv)).fromBond, true, "a request on the bond");
+    assert.match((await failure(requestTx(mint, iss, 1, vendorUsdc, inv))) ?? "", /already in use/, "the invoice is used once, whichever account pays");
+
+    // Both approvals, never the operator; paid straight from the bond
+    assert.match((await failure(approveTx(mint, authority, inv))) ?? "", /NotAnApprover/, "the operator's key cannot approve");
+    await approveTx(mint, p, inv);
+    assert.equal(await balance(vendorUsdc), 0, "one approval moves nothing");
+    await approveTx(mint, auditor, inv);
+    assert.equal(await balance(vendorUsdc), half, "the payee is paid");
+    assert.equal(await balance(bondPda), BOND_TARGET.toNumber() - half, "straight from the bond");
+    assert.match((await failure(requestTx(mint, iss, 1, vendorUsdc, invoice("ar-3"), 3, true))) ?? "", /BondUseExceedsLimit/, "the other half stays");
+
+    // Redemptions go on while the bond is below its target
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    const next = await provisionUntilBudget(mint);
+    assert.equal(next.budget, OBLIGATION, "the next obligation is provisioned as usual");
+
+    // The issuer's share of later fees refills the bond first, then the rest goes on as before
+    await convertTx(mint, 10_000, 5_000_000);
+    assert.equal(await balance(bondPda), BOND_TARGET.toNumber(), "refilled to the target from the issuer's share");
+    assert.equal(await balance(client.pdas.issuerEscrow(mint)[0]), 1_000_000 - half, "the rest of the issuer's share goes to the escrow");
+    assert.equal(await balance(issuerUsdc), 0, "nothing goes to the issuer's account");
+
+    // Before the bond first reaches its target, it cannot be drawn on
+    const iss2 = Keypair.generate();
+    await airdrop(iss2.publicKey, 5);
+    const fresh = await createTorusMint({ mintAuthority: iss2 });
+    await issueTokenTx(fresh, iss2);
+    await setManifestTx(fresh, TERM_LEN, { issuer: iss2 });
+    await setTermsTx(fresh);
+    assert.match((await failure(requestTx(fresh, iss2, 1, vendorUsdc, invoice("ar-4"), 3, true))) ?? "", /BondTargetNotReached/, "not before the bond is full");
+  });
+
+  // ---------------------------------------------------------------- distribution, perks
+
+  /** Commit → uniqueness → sample → disclosures → honest observations: the cycle is Verified, ready to finalize. */
+  async function toVerified(mint: PublicKey, controlTotalOf: (budget: number) => number = (b) => b) {
+    const c = await commitAndSample(mint, controlTotalOf);
+    await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
+    await observe(mint, c.periodId, auditor);
+    return c;
+  }
+
+  async function auditOf(mint: PublicKey, periodId: BN): Promise<any> {
+    return program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
+  }
+
+  async function transferTx(mint: PublicKey, from: Keypair, src: PublicKey, dst: PublicKey, amount: number) {
+    const ix = await createTransferCheckedWithTransferHookInstruction(
+      connection, src, mint, dst, from.publicKey, BigInt(amount), DECIMALS, [], "confirmed", TOKEN_2022_PROGRAM_ID,
+    );
+    return sendAndConfirmTransaction(connection, new Transaction().add(ix), from === authority ? [authority] : [authority, from]);
+  }
+
+  async function brandAta(mint: PublicKey, owner: PublicKey) {
+    return createAssociatedTokenAccountIdempotent(connection, authority, mint, owner, undefined, TOKEN_2022_PROGRAM_ID);
+  }
+
+  function setPerkTermsTx(mint: PublicKey, params: typeof PERKS = PERKS) {
+    return program.methods
+      .setPerkTerms(params)
+      .accounts({
+        authority: authority.publicKey,
+        config: client.pdas.config()[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        perkTerms: client.pdas.perkTerms(mint)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+  }
+
+  function registerHolderTx(mint: PublicKey, owner: Keypair, account: PublicKey) {
+    return program.methods
+      .registerHolder()
+      .accounts({
+        holder: owner.publicKey,
+        tokenState: client.pdas.tokenState(mint)[0],
+        perkTerms: client.pdas.perkTerms(mint)[0],
+        mint,
+        holderToken: account,
+        holderRecord: client.pdas.holder(account)[0],
+        holderPerk: client.pdas.holderPerk(account)[0],
+        poolAuthority: client.pdas.poolAuthority(mint)[0],
+        hookProgram: hook.programId,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers(owner === authority ? [] : [owner])
+      .rpc();
+  }
+
+  async function holderRecordOf(account: PublicKey): Promise<any> {
+    return hook.account.holderRecord.fetch(client.pdas.holder(account)[0]);
+  }
+
+  function registerMerchantTx(mint: PublicKey, merchant: PublicKey) {
+    return program.methods
+      .registerMerchant()
+      .accounts({
+        issuer: issuer.publicKey,
+        tokenState: client.pdas.tokenState(mint)[0],
+        merchant,
+        merchantRecord: client.pdas.merchant(mint, merchant)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+  }
+
+  async function openPerkPeriodTx(mint: PublicKey) {
+    const ts = await tokenState(mint);
+    return program.methods
+      .openPerkPeriod()
+      .accounts({
+        crank: authority.publicKey,
+        tokenState: client.pdas.tokenState(mint)[0],
+        perkTerms: client.pdas.perkTerms(mint)[0],
+        localPartnerRecord: client.pdas.localPartner(ts.localPartner)[0],
+        volumeCounter: client.pdas.volumeCounter(mint)[0],
+        perkPeriod: client.pdas.perkPeriod(mint, ts.periodId)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+  }
+
+  async function redeemTx(
+    mint: PublicKey,
+    merchant: Keypair,
+    holder: Keypair,
+    account: PublicKey,
+    kind: number,
+    amount: number,
+    receiptId: number[] = Array.from(Keypair.generate().publicKey.toBytes()),
+  ) {
+    const ts = await tokenState(mint);
+    return program.methods
+      .redeemPerk(kind, new BN(amount), receiptId)
+      .accounts({
+        merchant: merchant.publicKey,
+        holder: holder.publicKey,
+        tokenState: client.pdas.tokenState(mint)[0],
+        perkTerms: client.pdas.perkTerms(mint)[0],
+        perkPeriod: client.pdas.perkPeriod(mint, ts.periodId)[0],
+        merchantRecord: client.pdas.merchant(mint, merchant.publicKey)[0],
+        mint,
+        holderToken: account,
+        holderRecord: client.pdas.holder(account)[0],
+        holderPerk: client.pdas.holderPerk(account)[0],
+        receipt: client.pdas.perkReceipt(mint, receiptId)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([merchant, holder].filter((k) => k !== authority))
+      .rpc();
+  }
+
+  async function restampTx(mint: PublicKey, holder: Keypair, account: PublicKey, amount: number, lp: Keypair = localPartner) {
+    return program.methods
+      .restamp(new BN(amount))
+      .accounts({
+        holder: holder.publicKey,
+        localPartner: lp.publicKey,
+        localPartnerRecord: client.pdas.localPartner(lp.publicKey)[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        perkTerms: client.pdas.perkTerms(mint)[0],
+        mint,
+        holderToken: account,
+        partnerToken: await brandAta(mint, lp.publicKey),
+        holderRecord: client.pdas.holder(account)[0],
+        poolAuthority: client.pdas.poolAuthority(mint)[0],
+        hookProgram: hook.programId,
+        tokenProgram: TOKEN_2022_PROGRAM_ID,
+      })
+      .signers([holder, lp].filter((k) => k !== authority))
+      .rpc();
+  }
+
+  it("(as) tax reconciliation: registered by the operator with the accountant's signature (never the issuer's key); a declared total within the book total passes", async () => {
+    const mint = await setupToken();
+    taxBook.set(mint.toBase58(), OBLIGATION);
+    const replaceTx = (accountant: Keypair, signer: Keypair) =>
+      program.methods
+        .replaceTaxAccountant(consent("warning and consent v2"))
+        .accounts({
+          authority: signer.publicKey,
+          config: client.pdas.config()[0],
+          tokenState: client.pdas.tokenState(mint)[0],
+          accountant: accountant.publicKey,
+          taxAccountantRecord: client.pdas.taxAccountant(mint)[0],
+        })
+        .signers([accountant, signer].filter((k) => k !== authority))
+        .rpc();
+    const outsider = Keypair.generate();
+    assert.match((await failure(replaceTx(issuer, authority))) ?? "", /Unauthorized/, "never the issuer's key");
+    assert.match((await failure(replaceTx(taxAccountant, outsider))) ?? "", /Unauthorized/, "only the operator");
+
+    const { periodId } = await toVerified(mint);
+    const report: any = await program.account.taxReport.fetch(client.pdas.taxReport(mint, periodId)[0]);
+    assert.equal(report.bookTotal.toNumber(), OBLIGATION);
+    assert.ok(report.accountant.equals(taxAccountant.publicKey));
+    assert.match((await failure(fileTaxReportTx(mint, OBLIGATION, outsider))) ?? "", /TaxAccountantNotRegistered/, "only the company's accountant files");
+
+    await finalizeTx(mint, periodId);
+    assert.equal((await auditOf(mint, periodId)).result, 1, "Pass");
+  });
+
+  it("(at) a declared total above the book total holds the cycle (payouts wait); a reconciled report within the hold resumes it", async () => {
+    const mint = await setupToken();
+    taxBook.set(mint.toBase58(), OBLIGATION / 2);
+    const { periodId } = await toVerified(mint);
+
+    await finalizeTx(mint, periodId);
+    let audit = await auditOf(mint, periodId);
+    assert.equal(audit.stage, 2, "still Verified: nothing is decided and no payout can run");
+    assert.isAbove(audit.taxHoldUntil.toNumber(), 0, "on hold");
+    assert.match((await failure(finalizeTx(mint, periodId))) ?? "", /TaxHoldActive/, "waits for the reconciled report");
+
+    await fileTaxReportTx(mint, OBLIGATION);
+    await finalizeTx(mint, periodId);
+    audit = await auditOf(mint, periodId);
+    assert.equal(audit.result, 1, "resumed: Pass");
+    assert.isTrue((await program.account.taxReport.fetch(client.pdas.taxReport(mint, periodId)[0])).refiled);
+  });
+
+  it("(au) a reconciled report that still shows a gap: only the book total is recognized, the rest is carried, and the cycle cannot pass", async () => {
+    const mint = await setupToken();
+    const book = OBLIGATION - OBLIGATION / 20; // 95%: above the shortfall floor, beyond the 5% tolerance
+    taxBook.set(mint.toBase58(), book);
+    const { periodId } = await toVerified(mint);
+    await finalizeTx(mint, periodId); // hold
+    const before = await tokenState(mint);
+
+    await fileTaxReportTx(mint, book); // reconciled, the gap remains
+    await finalizeTx(mint, periodId);
+    const audit = await auditOf(mint, periodId);
+    const after = await tokenState(mint);
+    assert.equal(audit.result, 4, "HonestShortfall, never a pass");
+    assert.equal(audit.reservedRemaining.toNumber(), book, "only the book total is recognized");
+    assert.equal(after.unfulfilled.sub(before.unfulfilled).toNumber(), OBLIGATION - book, "the rest is carried");
+    assert.isFalse(after.frozen);
+  });
+
+  it("(av) no reconciled report within the hold forfeits the cycle; no report by the deadline is a default and a late report is rejected", async () => {
+    // A: on hold, nobody reconciles → forfeited like fraud
+    const a = await setupToken();
+    taxBook.set(a.toBase58(), OBLIGATION / 2);
+    const ca = await toVerified(a);
+    await finalizeTx(a, ca.periodId);
+    await waitChainTime((await auditOf(a, ca.periodId)).taxHoldUntil.toNumber() + 1);
+    assert.match((await failure(fileTaxReportTx(a, OBLIGATION))) ?? "", /TaxReportLate/, "the hold has ended");
+    await finalizeTx(a, ca.periodId);
+    assert.equal((await auditOf(a, ca.periodId)).result, 6, "BookMismatch");
+    assert.isTrue((await tokenState(a)).frozen);
+    assert.equal(await balance(client.pdas.slashingBond(a)[0]), 0, "the bond is slashed");
+
+    // B: no report by the deadline → the issuer's default
+    const b = await setupToken();
+    taxBook.set(b.toBase58(), null);
+    const cb = await toVerified(b);
+    await waitChainTime((await tokenState(b)).auditDeadline.toNumber() + 1);
+    assert.match((await failure(fileTaxReportTx(b, OBLIGATION))) ?? "", /TaxReportLate/, "a late first report is rejected");
+    await finalizeTx(b, cb.periodId);
+    assert.equal((await auditOf(b, cb.periodId)).result, 3, "default (FraudUnderstatement)");
+    assert.isTrue((await tokenState(b)).frozen);
+  });
+
+  it("(aw) per-company rank table and local partner: the rules are enforced and the operator's share is split with the partner", async () => {
+    const mint = await createTorusMint();
+    await issueTokenTx(mint);
+    await setManifestTx(mint, TERM_LEN);
+    const terms = (tiers: number[], lp?: PublicKey) => setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, tiers, lp);
+    assert.match((await failure(terms([3_000, 2_000, 5_000, 6_500]))) ?? "", /InvalidTierShares/, "a higher rank never gets less");
+    assert.match((await failure(terms([2_000, 3_500, 5_000, 10_001]))) ?? "", /InvalidTierShares/, "at most 100%");
+
+    const lp2 = Keypair.generate();
+    const outsider = Keypair.generate();
+    await airdrop(outsider.publicKey, 1);
+    assert.match((await failure(registerLocalPartnerTx(lp2.publicKey, 10_001))) ?? "", /InvalidShareBps/, "at most 100%");
+    assert.match((await failure(registerLocalPartnerTx(lp2.publicKey, 3_000, outsider))) ?? "", /Unauthorized/, "only the operator");
+    await registerLocalPartnerTx(lp2.publicKey, 3_000);
+    await terms([1_000, 2_000, 3_000, 4_000], lp2.publicKey);
+    const ts = await tokenState(mint);
+    assert.equal(ts.distributionRatioBps, 1_000, "rank 0 share of this company");
+    assert.ok(ts.localPartner.equals(lp2.publicKey));
+
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+    const lpUsdc = await createAssociatedTokenAccountIdempotent(connection, authority, usdcMint, lp2.publicKey);
+    const split = async () => {
+      const [t0, p0] = [await balance(treasuryAta), await balance(lpUsdc)];
+      await convertTx(mint, 10_000, 100_000);
+      return [(await balance(treasuryAta)) - t0, (await balance(lpUsdc)) - p0];
+    };
+    // Operator share 90% of 100_000; the partner takes 30% of it
+    assert.deepEqual(await split(), [63_000, 27_000]);
+
+    // A revoked partner gets nothing (its share goes to the treasury) and cannot be named again
+    await program.methods
+      .revokeLocalPartner()
+      .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], localPartnerRecord: client.pdas.localPartner(lp2.publicKey)[0] })
+      .rpc();
+    assert.deepEqual(await split(), [90_000, 0]);
+    assert.match((await failure(terms(TIER_SHARES, lp2.publicKey))) ?? "", /LocalPartnerNotRegistered/);
+  });
+
+  it("(ax) the mint authority moves to the program; only a restamp mints, signed by the holder and the local partner, never more than it burns", async () => {
+    const mint = await setupToken();
+    const m0 = await getMint(connection, mint, undefined, TOKEN_2022_PROGRAM_ID);
+    assert.ok(m0.mintAuthority?.equals(client.pdas.poolAuthority(mint)[0]), "the program holds the mint authority");
+    const src = await brandAta(mint, authority.publicKey);
+    assert.isNotNull(
+      await failure(mintToChecked(connection, authority, mint, src, authority, 1, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID)),
+      "the issuer can no longer mint",
+    );
+
+    await setPerkTermsTx(mint, { ...PERKS, restampFeeBps: 1_000 });
+    await registerHolderTx(mint, authority, src);
+    const registeredAt = await chainTime();
+    const rec0 = await holderRecordOf(src);
+    assert.isAtMost(rec0.stampTs.toNumber(), registeredAt - 3 * PERKS.holdStepSecs.toNumber() + 5, "the balance held at registration starts at 0%");
+
+    const amount = await balance(src, TOKEN_2022_PROGRAM_ID);
+    const stranger = Keypair.generate();
+    await airdrop(stranger.publicKey, 1);
+    assert.match(
+      (await failure(restampTx(mint, authority, src, amount, stranger))) ?? "",
+      /LocalPartnerNotRegistered|AccountNotInitialized/,
+      "only with the company's local partner",
+    );
+
+    await restampTx(mint, authority, src, amount);
+    const fee = amount / 10;
+    const m1 = await getMint(connection, mint, undefined, TOKEN_2022_PROGRAM_ID);
+    assert.equal(m1.supply, m0.supply, "the supply does not grow");
+    assert.equal(await balance(src, TOKEN_2022_PROGRAM_ID), amount - fee, "the holder gets it back minus the fee");
+    assert.equal(await balance(await brandAta(mint, localPartner.publicKey), TOKEN_2022_PROGRAM_ID), fee, "the fee goes to the partner");
+    assert.isAtLeast((await holderRecordOf(src)).stampTs.toNumber(), registeredAt - 5, "the re-minted amount carries today's stamp");
+  });
+
+  it("(ay) perks: registration starts at 0%, received tokens carry today's stamp, budgets come from the previous obligation, trader and hold perks stay within allowances and budgets", async () => {
+    const mint = await setupToken({ periodLen: 20 });
+    await setPerkTermsTx(mint);
+    assert.match((await failure(setPerkTermsTx(mint, { ...PERKS, generalBps: 5_000 }))) ?? "", /InvalidPerkAllocation/, "100% in total");
+    assert.match((await failure(setPerkTermsTx(mint, { ...PERKS, holdRateBps: [1_000, 2_000, 0] }))) ?? "", /InvalidHoldRates/, "never rises");
+
+    const [alice, bob, shop] = [Keypair.generate(), Keypair.generate(), Keypair.generate()];
+    for (const k of [alice, bob, shop]) await airdrop(k.publicKey, 1);
+    const [src, aliceAta, bobAta] = [await brandAta(mint, authority.publicKey), await brandAta(mint, alice.publicKey), await brandAta(mint, bob.publicKey)];
+    await registerHolderTx(mint, authority, src); // registered with its balance: 0%
+    await registerHolderTx(mint, alice, aliceAta);
+    await registerHolderTx(mint, bob, bobAta);
+    await registerMerchantTx(mint, shop.publicKey);
+    const funded = await chainTime();
+    await transferTx(mint, authority, src, aliceAta, 1_500_000); // received from others: today's stamp
+    await transferTx(mint, alice, aliceAta, bobAta, 500_000); // alice sends: trader volume
+    await harvest(mint, [aliceAta, bobAta]);
+    assert.isAtLeast((await holderRecordOf(aliceAta)).stampTs.toNumber(), funded - 5);
+
+    const { periodId, budget } = await provisionUntilBudget(mint);
+    await openPerkPeriodTx(mint);
+    const pp: any = await program.account.perkPeriod.fetch(client.pdas.perkPeriod(mint, periodId)[0]);
+    assert.equal(pp.traderBudget.toNumber(), (budget * PERKS.traderBps) / BPS, "previous obligation × allocation");
+    assert.equal(pp.holdBudget.toNumber(), (budget * PERKS.holdBps) / BPS);
+    assert.equal(pp.traderRateBps, FEE_BPS / 2, "capped at half the transfer fee: trading with oneself loses");
+
+    // Trader perk: up to what alice sent last period × the rate
+    const allowance = (500_000 * (FEE_BPS / 2)) / BPS;
+    await redeemTx(mint, shop, alice, aliceAta, 0, allowance);
+    assert.match((await failure(redeemTx(mint, shop, alice, aliceAta, 0, 1))) ?? "", /PerkAllowanceExceeded/);
+    assert.match((await failure(redeemTx(mint, bob, alice, aliceAta, 1, 1_000))) ?? "", /AccountNotInitialized|MerchantNotRegistered/, "registered merchants only");
+
+    // Hold perk: fresh stamp → 30%, on purchases up to the period's lowest balance × cap per token
+    const cap = await balance(aliceAta, TOKEN_2022_PROGRAM_ID); // cap per token = 1 unit per unit
+    const receipt = Array.from(Keypair.generate().publicKey.toBytes());
+    await redeemTx(mint, shop, alice, aliceAta, 1, 100_000, receipt);
+    const r: any = await program.account.perkReceipt.fetch(client.pdas.perkReceipt(mint, receipt)[0]);
+    assert.equal(r.discount.toNumber(), 30_000);
+    assert.isNotNull(await failure(redeemTx(mint, shop, alice, aliceAta, 1, 1_000, receipt)), "a receipt is recorded once");
+    assert.match((await failure(redeemTx(mint, shop, alice, aliceAta, 1, cap - 100_000 + 1))) ?? "", /PerkAllowanceExceeded/);
+    assert.match((await failure(redeemTx(mint, shop, authority, src, 1, 100_000))) ?? "", /InvalidPerkRedemption/, "registration alone gives 0%");
+  });
+
+  it("(az) overstatement found by the deviation check is final at once: it waits neither for the tax report nor for a hold", async () => {
+    // A: no report yet and its deadline still ahead (a longer period). Waiting would leave the token unfrozen and the
+    //    escrow and the bond spendable until the deadline.
+    const a = await setupToken({ periodLen: 30 });
+    taxBook.set(a.toBase58(), null);
+    const ca = await commitAndSample(a, (b) => b);
+    await submitDisclosures(a, ca.periodId, ca.tree, ca.sampleIndices);
+    await observe(a, ca.periodId, auditor, (x) => x / 10n);
+    assert.isBelow(await chainTime(), (await tokenState(a)).auditDeadline.toNumber(), "the report is not due yet");
+    await finalizeTx(a, ca.periodId);
+    assert.equal((await auditOf(a, ca.periodId)).result, 2, "FraudOverstatement without waiting for the report");
+    assert.isTrue((await tokenState(a)).frozen);
+    assert.equal(await balance(client.pdas.slashingBond(a)[0]), 0, "the bond is slashed at once");
+
+    // B: the report shows a gap: no hold either
+    const b = await setupToken();
+    taxBook.set(b.toBase58(), OBLIGATION / 2);
+    const cb = await commitAndSample(b, (x) => x);
+    await submitDisclosures(b, cb.periodId, cb.tree, cb.sampleIndices);
+    await observe(b, cb.periodId, auditor, (x) => x / 10n);
+    await finalizeTx(b, cb.periodId);
+    const audit = await auditOf(b, cb.periodId);
+    assert.equal(audit.result, 2, "FraudOverstatement, not held");
+    assert.equal(audit.taxHoldUntil.toNumber(), 0, "no hold");
+    assert.isTrue((await tokenState(b)).frozen);
+  });
+
+  it("(ba) a cycle capped by the books pays each leaf only its share of the book total, so the carried gap is not paid twice", async () => {
+    const mint = await setupToken();
+    const book = OBLIGATION - OBLIGATION / 20; // as in (au): the gap remains after the reconciliation
+    taxBook.set(mint.toBase58(), book);
+    const c = await toVerified(mint);
+    await finalizeTx(mint, c.periodId); // hold
+    await fileTaxReportTx(mint, book);
+    await finalizeTx(mint, c.periodId);
+    assert.equal((await auditOf(mint, c.periodId)).result, 4, "HonestShortfall");
+
+    let paid = 0;
+    for (let i = 0; i < POP; i++) {
+      await confirmLeaf(mint, c.periodId, c.tree, i);
+      const usdc = await createAssociatedTokenAccountIdempotent(connection, authority, usdcMint, c.tree.beneficiaryAt(i));
+      await payoutTx(mint, c.periodId, usdc, i, c.tree);
+      const got = await balance(usdc);
+      assert.equal(got, Number((c.tree.valueAt(i) * BigInt(book)) / BigInt(c.controlTotal)), "its share of the book total");
+      paid += got;
+    }
+    assert.isAtMost(paid, book, "the cycle pays at most what the books show");
+  });
+
+  it("(bb) conversions go on when a revoked local partner has closed its USDC account; its share goes to the treasury", async () => {
+    const mint = await createTorusMint();
+    await issueTokenTx(mint);
+    await setManifestTx(mint, TERM_LEN);
+    const lp = Keypair.generate();
+    await airdrop(lp.publicKey, 1);
+    await registerLocalPartnerTx(lp.publicKey, 3_000);
+    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, TIER_SHARES, lp.publicKey);
+    const { dst } = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [dst]);
+
+    await program.methods
+      .revokeLocalPartner()
+      .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], localPartnerRecord: client.pdas.localPartner(lp.publicKey)[0] })
+      .rpc();
+    await closeAccount(connection, authority, getAssociatedTokenAddressSync(usdcMint, lp.publicKey), lp.publicKey, lp);
+    const t0 = await balance(treasuryAta);
+    assert.isNull(await failure(convertTx(mint, 10_000, 100_000)), "the revoked partner's account is not needed");
+    assert.equal((await balance(treasuryAta)) - t0, 80_000, "the operator's whole share goes to the treasury");
+  });
+
+  it("(bc) perks stop at the exit: afterwards no redemption is recorded, since no audit can take it any more", async () => {
+    const mint = await setupToken({ periodLen: 40 }); // the final audit and the exit fit in one period
+    await setPerkTermsTx(mint);
+    const [alice, shop] = [Keypair.generate(), Keypair.generate()];
+    for (const k of [alice, shop]) await airdrop(k.publicKey, 1);
+    const [src, aliceAta] = [await brandAta(mint, authority.publicKey), await brandAta(mint, alice.publicKey)];
+    await registerHolderTx(mint, alice, aliceAta);
+    await registerMerchantTx(mint, shop.publicKey);
+    await transferTx(mint, authority, src, aliceAta, VOLUME); // the exit's last period: volume, and today's stamp for alice
+    await harvest(mint, [aliceAta]);
+    await requestExitTx(mint);
+
+    const p = await provisionUntilBudget(mint);
+    await openPerkPeriodTx(mint);
+    await redeemTx(mint, shop, alice, aliceAta, 1, 10_000); // a perk of the final cycle is still recorded
+    const tree = buildTree(p.budget);
+    await commitTx(mint, p.periodId, tree, p.budget);
+    await verifyUniqueness(mint, p.periodId, tree);
+    await waitAfterCommit(mint, p.periodId);
+    await designateTx(mint, p.periodId);
+    await submitDisclosures(mint, p.periodId, tree, await sampledIndices(mint, p.periodId));
+    await observe(mint, p.periodId, auditor);
+    await finalizeTx(mint, p.periodId);
+    await finalizeExitTx(mint);
+    assert.isTrue((await tokenState(mint)).exited);
+    assert.match((await failure(redeemTx(mint, shop, alice, aliceAta, 1, 10_000))) ?? "", /TokenExited/, "no perk after the exit");
+    assert.match((await failure(listPerkTx(mint, alice, aliceAta, 1))) ?? "", /TokenExited/, "nothing can be listed after the exit either");
+  });
+
+  it("(bd) overstatement is final at once even without the uniqueness proof: withholding it does not delay the freeze", async () => {
+    // A cycle that could pass still waits for the proof ((ac)); one whose overstatement is found is fraud either way.
+    const mint = await setupToken();
+    const c = await commitAndSample(mint, (b) => b, POP, false); // the issuer withholds the uniqueness proof
+    await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
+    await observe(mint, c.periodId, auditor, (x) => x / 10n);
+    await finalizeTx(mint, c.periodId);
+    assert.equal((await auditOf(mint, c.periodId)).result, 2, "FraudOverstatement without waiting for the deadline");
+    assert.isTrue((await tokenState(mint)).frozen);
+    assert.equal(await balance(client.pdas.slashingBond(mint)[0]), 0, "the bond is slashed at once");
+  });
+
+  // ---------------------------------------------------------------- the perk market
+
+  async function listPerkTx(mint: PublicKey, seller: Keypair, account: PublicKey, amount: number, lp: Keypair = localPartner) {
+    const ts = await tokenState(mint);
+    return program.methods
+      .listPerk(new BN(amount))
+      .accounts({
+        seller: seller.publicKey,
+        localPartner: lp.publicKey,
+        localPartnerRecord: client.pdas.localPartner(lp.publicKey)[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        perkPeriod: client.pdas.perkPeriod(mint, ts.periodId)[0],
+        mint,
+        holderToken: account,
+        holderRecord: client.pdas.holder(account)[0],
+        holderPerk: client.pdas.holderPerk(account)[0],
+        lot: client.pdas.perkLot(mint, ts.periodId, account)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([seller, lp].filter((k) => k !== authority))
+      .rpc();
+  }
+
+  function closePerkLotTx(mint: PublicKey, seller: Keypair, lot: PublicKey) {
+    return program.methods
+      .closePerkLot()
+      .accounts({ seller: seller.publicKey, tokenState: client.pdas.tokenState(mint)[0], lot })
+      .signers([seller])
+      .rpc();
+  }
+
+  /**
+   * A token with a seller who sent `sent` last period and an open perk period. `received` goes from an unregistered
+   * account to the seller first, so the volume can be larger than what registered accounts sent.
+   */
+  async function setupSeller(mint: PublicKey, received: number, sent: number, perks: typeof PERKS = PERKS) {
+    await setPerkTermsTx(mint, perks);
+    const [seller, buyer, shop] = [Keypair.generate(), Keypair.generate(), Keypair.generate()];
+    for (const k of [seller, buyer, shop]) await airdrop(k.publicKey, 1);
+    const [src, sellerAta, buyerAta] = [await brandAta(mint, authority.publicKey), await brandAta(mint, seller.publicKey), await brandAta(mint, buyer.publicKey)];
+    await registerHolderTx(mint, seller, sellerAta);
+    await registerMerchantTx(mint, shop.publicKey);
+    await transferTx(mint, authority, src, sellerAta, received);
+    await transferTx(mint, seller, sellerAta, buyerAta, sent);
+    await harvest(mint, [sellerAta, buyerAta]);
+    const provisioned = await provisionUntilBudget(mint);
+    await openPerkPeriodTx(mint);
+    return { seller, buyer, shop, sellerAta, ...provisioned, lot: client.pdas.perkLot(mint, provisioned.periodId, sellerAta)[0] };
+  }
+
+  it("(be) listing moves part of the trader perk into the seller's lot: within the allowance, with the local partner's signature, sharing one allowance with the seller's own use", async () => {
+    const mint = await setupToken({ periodLen: 30 });
+    assert.match((await failure(setPerkTermsTx(mint, { ...PERKS, maxAskBps: 9_001 }))) ?? "", /InvalidPerkMarketTerms/, "customers keep at least 10%");
+    assert.match((await failure(setPerkTermsTx(mint, { ...PERKS, usageCapBps: 5_001 }))) ?? "", /InvalidPerkMarketTerms/, "at least half must be a real purchase");
+
+    const { seller, buyer, shop, sellerAta, periodId, lot } = await setupSeller(mint, 1_500_000, 500_000);
+    const period: any = await program.account.perkPeriod.fetch(client.pdas.perkPeriod(mint, periodId)[0]);
+    assert.equal(period.traderRateBps, FEE_BPS / 2);
+    assert.equal(period.listableRateBps, FEE_BPS / 2, "fee × (1 − 65%) + a 50% return rate is far above half the fee");
+    assert.equal(period.maxAskBps, PERKS.maxAskBps);
+    assert.equal(period.usageCapBps, PERKS.usageCapBps);
+    const allowance = (500_000 * (FEE_BPS / 2)) / BPS; // 2,500
+
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 0))) ?? "", /InvalidPerkListing/);
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 100, Keypair.generate()))) ?? "", /AccountNotInitialized|LocalPartnerNotRegistered/, "the local partner co-signs");
+    assert.isNotNull(await failure(listPerkTx(mint, buyer, sellerAta, 100)), "only the account's owner can list");
+
+    await listPerkTx(mint, seller, sellerAta, 1_000);
+    await listPerkTx(mint, seller, sellerAta, 500);
+    const stored: any = await program.account.perkLot.fetch(lot);
+    assert.equal(stored.listed.toNumber(), 1_500, "listing again adds to the lot");
+    assert.equal(stored.seller.toBase58(), seller.publicKey.toBase58());
+    assert.equal(stored.account.toBase58(), sellerAta.toBase58());
+    assert.equal(stored.periodId.toNumber(), periodId.toNumber());
+    assert.equal(((await program.account.perkPeriod.fetch(client.pdas.perkPeriod(mint, periodId)[0])) as any).traderUsed.toNumber(), 1_500, "the budget is reserved at listing");
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, allowance - 1_500 + 1))) ?? "", /PerkAllowanceExceeded/);
+
+    // One allowance: what is listed cannot also be used by the seller
+    await redeemTx(mint, shop, seller, sellerAta, 0, allowance - 1_500);
+    assert.match((await failure(redeemTx(mint, shop, seller, sellerAta, 0, 1))) ?? "", /PerkAllowanceExceeded/);
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 1))) ?? "", /PerkAllowanceExceeded/);
+    assert.match((await failure(closePerkLotTx(mint, seller, lot))) ?? "", /PerkLotStillOpen/, "the period is still open");
+    assert.isNotNull(await failure(closePerkLotTx(mint, buyer, lot)), "only the seller can close the lot");
+  });
+
+  it("(bf) what can be listed is capped below half the fee when the issuer's share would let an insider profit", async () => {
+    // Fee 1%, top share 80%, return 0.1%: sending costs an insider 0.2% + 0.1%. Half the fee (0.5%) would pay at an ask of 80%.
+    const mint = await setupToken({ periodLen: 30, returnRateBps: 10, floorBps: 10, tiers: [5_000, 6_000, 7_000, 8_000] });
+    const { seller, shop, sellerAta, periodId, lot } = await setupSeller(mint, VOLUME, 100_000);
+    const period: any = await program.account.perkPeriod.fetch(client.pdas.perkPeriod(mint, periodId)[0]);
+    assert.equal(period.traderRateBps, FEE_BPS / 2, "few registered accounts: the trader rate is at its cap");
+    assert.equal(period.listableRateBps, 30, "20 kept + 10 return");
+
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 301))) ?? "", /PerkAllowanceExceeded/, "100,000 × 0.3% = 300");
+    await listPerkTx(mint, seller, sellerAta, 300);
+    assert.equal(((await program.account.perkLot.fetch(lot)) as any).listed.toNumber(), 300);
+
+    // The seller can still use the rest of its own allowance as a discount: only selling is capped
+    await redeemTx(mint, shop, seller, sellerAta, 0, 200);
+    assert.match((await failure(redeemTx(mint, shop, seller, sellerAta, 0, 1))) ?? "", /PerkAllowanceExceeded/, "100,000 × 0.5% = 500 in all");
+  });
+
+  it("(bg) a customer's use settles through the existing audit and payout: the pool pays the face value, split between the merchant and the seller; the lot's rent comes back after its period closes", async () => {
+    const mint = await setupToken({ periodLen: 30 });
+    const { seller, shop, sellerAta, periodId, budget, lot } = await setupSeller(mint, 1_500_000, 500_000);
+    const rentBefore = await connection.getBalance(seller.publicKey);
+    await listPerkTx(mint, seller, sellerAta, 2_000);
+
+    // A customer used 1,500 of the lot at an ask of 70% at the merchant's shop (off-chain, signed at checkout).
+    const face = 1_500;
+    const sellerValue = (face * 7_000) / BPS;
+    const merchantValue = face - sellerValue;
+    const others = distributeLeafValues(budget - face, POP - 2).map((value) => ({
+      outcomeId: newOutcome(),
+      beneficiary: Keypair.generate().publicKey,
+      value,
+    }));
+    const tree = new SumTree(sortByOutcome([
+      { outcomeId: newOutcome(), beneficiary: seller.publicKey, value: BigInt(sellerValue) },
+      { outcomeId: newOutcome(), beneficiary: shop.publicKey, value: BigInt(merchantValue) },
+      ...others,
+    ]));
+    await commitTx(mint, periodId, tree, budget);
+    await verifyUniqueness(mint, periodId, tree);
+    await waitAfterCommit(mint, periodId);
+    await designateTx(mint, periodId);
+    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId));
+    await observe(mint, periodId, auditor);
+    await finalizeTx(mint, periodId);
+    assert.equal((await auditOf(mint, periodId)).result, 1, "Pass");
+
+    let paid = 0;
+    for (const [owner, value] of [[seller.publicKey, sellerValue], [shop.publicKey, merchantValue]] as [PublicKey, number][]) {
+      const index = [...Array(POP).keys()].find((i) => tree.beneficiaryAt(i).equals(owner))!;
+      const usdc = await createAssociatedTokenAccountIdempotent(connection, authority, usdcMint, owner);
+      await confirmLeaf(mint, periodId, tree, index);
+      await payoutTx(mint, periodId, usdc, index, tree);
+      assert.equal(await balance(usdc), value);
+      paid += await balance(usdc);
+      assert.isNotNull(await failure(payoutTx(mint, periodId, usdc, index, tree)), "a leaf is paid once");
+    }
+    assert.equal(paid, face, "merchant + seller = the face value, the same as if the seller had used the perk");
+
+    await waitPeriod(mint);
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 1))) ?? "", /PerkPeriodNotCurrent/, "the period is over, even before anyone provisions the next one");
+    await provision(mint);
+    assert.match((await failure(closePerkLotTx(mint, seller, lot))) ?? "", /PerkLotStillOpen/, "kept until the audit deadline of its period has passed");
+    await waitPeriod(mint);
+    await provision(mint);
+    await closePerkLotTx(mint, seller, lot);
+    assert.isNull(await connection.getAccountInfo(lot), "closed");
+    assert.isAtMost(rentBefore - (await connection.getBalance(seller.publicKey)), 100_000, "the rent came back, only fees are gone");
+  });
+
+  it("(bh) a company can turn listing off for a period, and later terms do not change an open period", async () => {
+    const mint = await setupToken({ periodLen: 30 });
+    const { seller, sellerAta } = await setupSeller(mint, 1_500_000, 500_000, { ...PERKS, usageCapBps: 0 });
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 100))) ?? "", /PerkListingClosed/);
+    await setPerkTermsTx(mint);
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 100))) ?? "", /PerkListingClosed/, "the open period keeps its terms");
+  });
+
+  it("(bi) a freeze stops listing; the lot can still be closed", async () => {
+    const mint = await setupToken({ periodLen: 30 });
+    const { seller, sellerAta, periodId, budget, lot } = await setupSeller(mint, 1_500_000, 500_000);
+    await listPerkTx(mint, seller, sellerAta, 100);
+
+    const tree = buildTree(budget);
+    await commitTx(mint, periodId, tree, budget);
+    await verifyUniqueness(mint, periodId, tree);
+    await waitAfterCommit(mint, periodId);
+    await designateTx(mint, periodId);
+    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId));
+    await observe(mint, periodId, auditor, (x) => x / 10n);
+    await finalizeTx(mint, periodId);
+    assert.isTrue((await tokenState(mint)).frozen);
+
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 100))) ?? "", /TokenFrozen/);
+    await closePerkLotTx(mint, seller, lot);
+    assert.isNull(await connection.getAccountInfo(lot));
+  });
+
+  it("(bj) a local partner's share lowers what can be listed; a revoked partner's does not", async () => {
+    // Fee 1%, top share 80%, return 0.1%: with a partner on 50%, sending costs the issuer's side and the partner only 0.1% + 0.1%.
+    const mint = await setupToken({ periodLen: 30, returnRateBps: 10, floorBps: 10, tiers: [5_000, 6_000, 7_000, 8_000] });
+    const lp = Keypair.generate();
+    await airdrop(lp.publicKey, 1);
+    await registerLocalPartnerTx(lp.publicKey, 5_000);
+    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, [5_000, 6_000, 7_000, 8_000], lp.publicKey);
+    const { seller, sellerAta, periodId, lot } = await setupSeller(mint, VOLUME, 100_000);
+    const period: any = await program.account.perkPeriod.fetch(client.pdas.perkPeriod(mint, periodId)[0]);
+    assert.equal(period.listableRateBps, 20, "10 kept + 10 return");
+    assert.match((await failure(listPerkTx(mint, seller, sellerAta, 201, lp))) ?? "", /PerkAllowanceExceeded/, "100,000 × 0.2% = 200");
+    await listPerkTx(mint, seller, sellerAta, 200, lp);
+    assert.equal(((await program.account.perkLot.fetch(lot)) as any).listed.toNumber(), 200);
+
+    // Revoked: its share goes to the treasury, so nothing comes back to it any more.
+    const other = await setupToken({ periodLen: 30, returnRateBps: 10, floorBps: 10, tiers: [5_000, 6_000, 7_000, 8_000] });
+    const revoked = Keypair.generate();
+    await airdrop(revoked.publicKey, 1);
+    await registerLocalPartnerTx(revoked.publicKey, 5_000);
+    await setTermsTx(other, authority, BOND_TARGET, MIN_PRICE, [5_000, 6_000, 7_000, 8_000], revoked.publicKey);
+    await program.methods
+      .revokeLocalPartner()
+      .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], localPartnerRecord: client.pdas.localPartner(revoked.publicKey)[0] })
+      .rpc();
+    const opened = await setupSeller(other, VOLUME, 100_000);
+    const otherPeriod: any = await program.account.perkPeriod.fetch(client.pdas.perkPeriod(other, opened.periodId)[0]);
+    assert.equal(otherPeriod.listableRateBps, 30, "20 kept + 10 return");
+    assert.match((await failure(listPerkTx(other, opened.seller, opened.sellerAta, 1, revoked))) ?? "", /LocalPartnerNotRegistered/, "a revoked partner cannot co-sign");
+  });
+
+  it("(bk) an account that changes hands mid-period cannot redirect its lot", async () => {
+    const mint = await setupToken({ periodLen: 30 });
+    await setPerkTermsTx(mint, PERKS);
+    const [seller, buyer, nextOwner] = [Keypair.generate(), Keypair.generate(), Keypair.generate()];
+    for (const k of [seller, buyer, nextOwner]) await airdrop(k.publicKey, 1);
+    const src = await brandAta(mint, authority.publicKey);
+    const buyerAta = await brandAta(mint, buyer.publicKey);
+    // An associated token account's owner is immutable, so this needs a plain account.
+    const account = await createAccount(connection, authority, mint, seller.publicKey, Keypair.generate(), undefined, TOKEN_2022_PROGRAM_ID);
+    await registerHolderTx(mint, seller, account);
+    await transferTx(mint, authority, src, account, 1_500_000);
+    await transferTx(mint, seller, account, buyerAta, 500_000);
+    await harvest(mint, [account, buyerAta]);
+    const { periodId } = await provisionUntilBudget(mint);
+    await openPerkPeriodTx(mint);
+    await listPerkTx(mint, seller, account, 100);
+    await setAuthority(connection, authority, account, seller, AuthorityType.AccountOwner, nextOwner.publicKey, [], undefined, TOKEN_2022_PROGRAM_ID);
+    assert.match((await failure(listPerkTx(mint, nextOwner, account, 100))) ?? "", /Unauthorized/);
+    const lot: any = await program.account.perkLot.fetch(client.pdas.perkLot(mint, periodId, account)[0]);
+    assert.equal(lot.seller.toBase58(), seller.publicKey.toBase58());
+    assert.equal(lot.listed.toNumber(), 100);
   });
 });

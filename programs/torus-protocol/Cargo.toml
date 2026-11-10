@@ -15,11 +15,14 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "torus-hook/idl-build"]
 
 [dependencies]
 anchor-lang = { version = "0.31.2", features = ["init-if-needed"] }
 anchor-spl = { version = "0.31.2", features = ["token_2022", "token_2022_extensions"] }
+# The hook keeps each registered account's record (stamp, minimum balance, volume sent). The core program creates and
+# restamps it through CPI (signed by its pool PDA) and reads it for perks.
+torus-hook = { path = "../torus-hook", features = ["cpi"] }
 # NOTE: the core program does not implement the transfer hook, so it has no direct dependency on
 #   spl-token-2022 / spl-transfer-hook-interface / spl-tlv-account-resolution (avoids version conflicts).
 #   Mint extension checks use the re-exports, e.g.

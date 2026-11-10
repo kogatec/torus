@@ -234,4 +234,104 @@ pub enum TorusError {
 
     #[msg("This auditor's registration has been revoked")]
     AuditorRevoked,
+
+    #[msg("During a campaign the manifest cannot change in the issuer's favor (lower return rate, looser tolerances, smaller sample, more allowed defects, shorter term or another use plan)")]
+    ManifestChangeFavorsIssuer,
+
+    #[msg("Close the elapsed periods (provision_budget) before changing the manifest again")]
+    PeriodsNotClosed,
+
+    #[msg("The issuer, the auditor and the escrow partner must be different keys, and the escrow partner cannot be the operator")]
+    RolesNotSeparate,
+
+    #[msg("The escrow partner cannot be changed during a campaign unless its registration was revoked")]
+    EscrowPartnerLocked,
+
+    #[msg("This partner's registration has been revoked")]
+    PartnerRevoked,
+
+    #[msg("The manifest has no use plan")]
+    UsePlanNotSet,
+
+    #[msg("The amount is zero or exceeds the escrow balance released by clean audits")]
+    WithdrawalExceedsReleased,
+
+    #[msg("The payee is the issuer's own account")]
+    PayeeIsIssuer,
+
+    #[msg("This withdrawal request has already been executed")]
+    WithdrawalAlreadyExecuted,
+
+    #[msg("Only the token's escrow partner and the manifest's auditor can approve (never the operator or the issuer)")]
+    NotAnApprover,
+
+    #[msg("A payment from the bond must leave at least half of the bond target in it")]
+    BondUseExceedsLimit,
+
+    #[msg("The issuer's share per rank must be at most 100% and must not decrease as the rank rises")]
+    InvalidTierShares,
+
+    #[msg("A share or fee must be at most 100%")]
+    InvalidShareBps,
+
+    #[msg("The local partner is not registered or was revoked")]
+    LocalPartnerNotRegistered,
+
+    #[msg("Perk allocation must total 100% with general >= trader >= hold")]
+    InvalidPerkAllocation,
+
+    #[msg("Hold perk rates must be at most 100%, must not rise over time, and the step must be positive")]
+    InvalidHoldRates,
+
+    #[msg("Perks run only in the current period, after its obligation is provisioned")]
+    PerkPeriodNotCurrent,
+
+    #[msg("The merchant is not registered for this token or was revoked")]
+    MerchantNotRegistered,
+
+    #[msg("The account is not registered for perks")]
+    HolderNotRegistered,
+
+    #[msg("Invalid perk kind or amount")]
+    InvalidPerkRedemption,
+
+    #[msg("The redemption exceeds the account's allowance for this period")]
+    PerkAllowanceExceeded,
+
+    #[msg("The redemption exceeds this period's perk budget")]
+    PerkBudgetExceeded,
+
+    #[msg("The restamp amount must be positive and within the balance")]
+    InvalidRestampAmount,
+
+    #[msg("The ask cap must be at most 90% and the usage cap at most 50%")]
+    InvalidPerkMarketTerms,
+
+    #[msg("The listing amount must be positive")]
+    InvalidPerkListing,
+
+    #[msg("This company does not allow trader perks to be listed")]
+    PerkListingClosed,
+
+    #[msg("The lot's period has not been closed yet")]
+    PerkLotStillOpen,
+    // Kept last, so the codes of the other errors are the same with or without them.
+
+    #[msg("The hold period of the tax reconciliation must be positive")]
+    InvalidHoldPeriod,
+
+    #[msg("The tax accountant is not registered for this token or was revoked")]
+    TaxAccountantNotRegistered,
+
+    #[msg("No obligation of this cycle is waiting for a tax report")]
+    NoCycleToReport,
+
+    #[msg("The deadline for the tax accountant's report has passed")]
+    TaxReportLate,
+
+    #[msg("The tax accountant's report for this cycle has not been filed yet")]
+    TaxReportMissing,
+
+    #[msg("The cycle is on hold until the tax accountant files a reconciled report or the hold ends")]
+    TaxHoldActive,
 }

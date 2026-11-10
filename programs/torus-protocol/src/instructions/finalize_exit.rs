@@ -5,15 +5,15 @@
 //!   - if metering started: at least one provision after the request (the requested period's volume is
 //!     provisioned) and that obligation's audit is final (a period with budget 0 has no audit)
 //!
-//! [Bond] On a voluntary exit, EXIT_ISSUER_SHARE_BPS (half) of the bond goes back to the issuer and the rest to
-//!   the operator treasury (Config.treasury). On a forced exit for a violation the whole bond is slashed
+//! [Bond] On a voluntary exit, the issuer's part of the bond (EXIT_ISSUER_SHARE_BPS, half) goes to its customers, not to
+//!   the issuer: into the redemption pool, which liquidation splits over the recipients of the last clean audit. The rest
+//!   goes to the operator treasury (Config.treasury). On a forced exit for a violation the whole bond is slashed
 //!   (finalize_audit / declare_default).
 //!
-//! [Issuer share] After the final audit, the shares left in the escrow (pending, accruing) become claimable
-//!   (through claim_distribution).
+//! [Issuer escrow] Whatever is left in the escrow (released, pending or accruing) goes to the redemption pool as well.
 //!
-//! [After the exit] No provision, conversion, deposit or commitment (TokenExited). Payouts of finalized audits
-//!   and claims of the issuer share continue. Only the pool_authority PDA signs.
+//! [After the exit] No provision, deposit or commitment (TokenExited). Payouts of finalized audits continue, and the
+//!   issuer's share of later conversions goes to the redemption pool too. Only the pool_authority PDA signs.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
@@ -48,17 +48,17 @@ pub fn handler(ctx: Context<FinalizeExit>) -> Result<()> {
         }
     }
 
-    // ===== Bond: half to the issuer, the rest to the operator treasury =====
+    // ===== Bond: the issuer's half to its customers (redemption pool), the rest to the operator treasury =====
     let bond_balance = ctx.accounts.slashing_bond.amount;
-    let to_issuer = mul_bps(bond_balance, EXIT_ISSUER_SHARE_BPS)?;
-    let to_operator = bond_balance - to_issuer;
+    let to_customers = mul_bps(bond_balance, EXIT_ISSUER_SHARE_BPS)?;
+    let to_operator = bond_balance - to_customers;
 
     let mint_key = ctx.accounts.token_state.mint;
     let bump = ctx.accounts.token_state.pool_authority_bump;
     let seeds: &[&[u8]] = &[POOL_AUTHORITY_SEED, mint_key.as_ref(), &[bump]];
     let decimals = ctx.accounts.usdc_mint.decimals;
     let legs: [(u64, AccountInfo<'_>); 2] = [
-        (to_issuer, ctx.accounts.issuer_usdc.to_account_info()),
+        (to_customers, ctx.accounts.redemption_vault.to_account_info()),
         (to_operator, ctx.accounts.treasury.to_account_info()),
     ];
     for (amount, to) in legs.into_iter() {
@@ -81,24 +81,37 @@ pub fn handler(ctx: Context<FinalizeExit>) -> Result<()> {
         )?;
     }
 
-    // ===== Issuer share: claimable after the final audit =====
+    // ===== Issuer escrow: what is left goes to the customers too =====
+    let escrow_balance = ctx.accounts.issuer_escrow.amount;
+    if escrow_balance > 0 {
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.usdc_token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.issuer_escrow.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.redemption_vault.to_account_info(),
+                    authority: ctx.accounts.pool_authority.to_account_info(),
+                },
+                &[seeds],
+            ),
+            escrow_balance,
+            decimals,
+        )?;
+    }
     let ts = &mut ctx.accounts.token_state;
-    ts.issuer_claimable = ts
-        .issuer_claimable
-        .checked_add(ts.issuer_pending)
-        .and_then(|v| v.checked_add(ts.issuer_accruing))
-        .ok_or(TorusError::MathOverflow)?;
+    ts.issuer_claimable = 0;
     ts.issuer_pending = 0;
     ts.issuer_accruing = 0;
     ts.exited = true;
 
     msg!(
-        "finalize_exit: mint={} bond={} to_issuer={} to_operator={} issuer_claimable={}",
+        "finalize_exit: mint={} bond={} to_customers={} to_operator={} escrow_to_customers={}",
         mint_key,
         bond_balance,
-        to_issuer,
+        to_customers,
         to_operator,
-        ts.issuer_claimable
+        escrow_balance
     );
     Ok(())
 }
@@ -122,7 +135,7 @@ pub struct FinalizeExit<'info> {
     /// started and the current budget > 0. The handler checks its address against the PDA.
     pub audit: Option<Box<Account<'info, AuditCycle>>>,
 
-    /// Pool PDA (authority of the bond).
+    /// Pool PDA (authority of the bond and the escrow).
     /// CHECK: bound by seeds; signs as a program-derived address.
     #[account(
         seeds = [POOL_AUTHORITY_SEED, token_state.mint.as_ref()],
@@ -134,13 +147,13 @@ pub struct FinalizeExit<'info> {
     #[account(mut, address = token_state.slashing_bond @ TorusError::Unauthorized)]
     pub slashing_bond: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// Refund destination: a USDC account owned by the issuer.
-    #[account(
-        mut,
-        token::mint = usdc_mint,
-        constraint = issuer_usdc.owner == token_state.issuer @ TorusError::Unauthorized,
-    )]
-    pub issuer_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// First account (the redemption pool): receives the issuer's half of the bond and the escrow's remainder.
+    #[account(mut, address = token_state.redemption_vault @ TorusError::Unauthorized)]
+    pub redemption_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The issuer escrow (emptied into the redemption pool).
+    #[account(mut, address = token_state.issuer_escrow @ TorusError::Unauthorized)]
+    pub issuer_escrow: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Operator treasury (fixed in Config).
     #[account(mut, address = config.treasury @ TorusError::Unauthorized)]

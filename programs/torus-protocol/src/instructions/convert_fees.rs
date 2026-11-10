@@ -3,16 +3,18 @@
 //!
 //! [Flow] The partner (an exchange operator) pays USDC and receives brand tokens from fee_vault. Both legs happen
 //! in one instruction (never one without the other). The USDC goes, in this order:
-//!   1. split by the tier's distribution ratio: the operator's share (1 − ratio) → Config.treasury, the rest is
-//!      the issuer's share. The operator's fee is never counted as bond.
+//!   1. split by the issuer's share for its rank (set per company): the operator's share (1 − share), the rest is
+//!      the issuer's share. The operator's fee is never counted as bond. The operator's share is split again between
+//!      the company's local partner (its share, fixed at registration; nothing if revoked) and Config.treasury.
 //!   2. from the issuer's share: the bond first, up to bond_target (set per company by the operator)
 //!   3. then the redemption pool, up to what is owed
-//!   4. the rest into the issuer escrow (not withdrawable until the audit finalizes without fraud)
+//!   4. the rest into the issuer escrow (released by a clean audit; spent only through withdrawal requests approved by
+//!      the escrow partner and the auditor)
 //!   owed = reserved (provisioned, unpaid) + the budget the current period's volume will create
 //!          (what the next provision_budget will require; the volume and the funds come from the same transfers).
 //!          Volume before metering starts (before the bond is full) is not counted.
-//!   After an exit there is no obligation: nothing goes to the bond or the pool; the operator's share goes to
-//!          Config.treasury and the issuer's share to the escrow, immediately claimable (claim_distribution).
+//!   After an exit there is no obligation: nothing goes to the bond; the operator's share goes to Config.treasury and
+//!          the issuer's share to the redemption pool for its customers (split in liquidation).
 //!
 //! [Keys] No issuer signature. The brand tokens leave under the pool_authority PDA's signature and the USDC comes
 //!   under the partner's signature straight into the pool accounts. The issuer can neither skip the deposit nor
@@ -33,7 +35,8 @@ use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, Tran
 use crate::constants::*;
 use crate::errors::TorusError;
 use crate::instructions::provision_budget::{mul_bps, read_volume_counter};
-use crate::state::{Config, Manifest, PartnerRecord, TokenState};
+use crate::rules;
+use crate::state::{Config, LocalPartnerRecord, Manifest, PartnerRecord, TokenState};
 
 pub fn handler<'info>(
     ctx: Context<'_, '_, '_, 'info, ConvertFees<'info>>,
@@ -64,10 +67,10 @@ pub fn handler<'info>(
     let accrued_budget = if ts.periods_started && !ts.exited {
         let (counter_total, _) =
             read_volume_counter(&ctx.accounts.volume_counter.to_account_info())?;
-        mul_bps(
-            counter_total.saturating_sub(ts.current_period_activity),
-            ctx.accounts.manifest.return_rate_bps,
-        )?
+        // The open period's rate: the one in force when it started, none if it started between campaigns.
+        let terms = ctx.accounts.manifest.terms_at(ts.period_start_ts);
+        let rate = if ts.period_start_ts <= terms.valid_until { terms.return_rate_bps } else { 0 };
+        mul_bps(counter_total.saturating_sub(ts.current_period_activity), rate)?
     } else {
         0
     };
@@ -80,9 +83,12 @@ pub fn handler<'info>(
     let bond_balance = ctx.accounts.slashing_bond.amount;
     let vault_balance = ctx.accounts.redemption_vault.amount;
 
-    // 1. Operator share and issuer share (tier ratio). The operator's share never goes into the bond.
+    // 1. Operator share and issuer share (the share of the issuer's rank). The operator's share never goes into the
+    //    bond; the local partner's part of it goes to the partner's account.
     let issuer_side = mul_bps(usdc_amount, ts.distribution_ratio_bps)?;
-    let to_operator = usdc_amount - issuer_side;
+    let lp = &ctx.accounts.local_partner_record;
+    let (to_local_partner, to_operator) =
+        rules::split_operator_share(usdc_amount - issuer_side, lp.share_bps, lp.active)?;
     // 2. From the issuer's share, the bond first, up to its target (not after an exit)
     let to_bond = if ts.exited {
         0
@@ -91,8 +97,9 @@ pub fn handler<'info>(
     };
     let after_bond = issuer_side - to_bond;
     // 3. then the redemption pool up to what is owed, 4. the rest into the escrow
+    //    (after an exit, all of the issuer's share goes to the pool for its customers)
     let to_vault = if ts.exited {
-        0
+        after_bond
     } else {
         after_bond.min(required.saturating_sub(vault_balance))
     };
@@ -100,10 +107,11 @@ pub fn handler<'info>(
 
     // ===== USDC: partner → pool accounts (signed by the partner) =====
     let usdc_decimals = ctx.accounts.usdc_mint.decimals;
-    let legs: [(u64, AccountInfo<'info>); 4] = [
+    let legs: [(u64, AccountInfo<'info>); 5] = [
         (to_bond, ctx.accounts.slashing_bond.to_account_info()),
         (to_vault, ctx.accounts.redemption_vault.to_account_info()),
         (to_operator, ctx.accounts.treasury.to_account_info()),
+        (to_local_partner, ctx.accounts.local_partner_usdc.to_account_info()),
         (to_issuer, ctx.accounts.issuer_escrow.to_account_info()),
     ];
     for (amount, to) in legs.into_iter() {
@@ -147,11 +155,14 @@ pub fn handler<'info>(
     // ===== Bookkeeping =====
     let ts = &mut ctx.accounts.token_state;
     if ts.exited {
-        // After an exit there is nothing to audit, so the issuer's share is claimable right away.
-        ts.issuer_claimable = ts
-            .issuer_claimable
-            .checked_add(to_issuer)
-            .ok_or(TorusError::MathOverflow)?;
+        // After an exit the issuer's share goes to its customers: once liquidation has started with a basis, it is
+        // added to the split (before that, start_liquidation counts it in the pool's surplus).
+        if ts.liquidation_started && ts.last_good_period > 0 {
+            ts.liquidation_pool = ts
+                .liquidation_pool
+                .checked_add(to_vault)
+                .ok_or(TorusError::MathOverflow)?;
+        }
     } else {
         ts.issuer_accruing = ts
             .issuer_accruing
@@ -163,7 +174,7 @@ pub fn handler<'info>(
     }
 
     msg!(
-        "convert_fees: mint={} partner={} tokens={} usdc={} to_bond={} to_vault={} to_operator={} to_issuer={} required={} ratio_bps={}",
+        "convert_fees: mint={} partner={} tokens={} usdc={} to_bond={} to_vault={} to_operator={} to_local_partner={} to_issuer={} required={} ratio_bps={}",
         mint_key,
         ctx.accounts.partner.key(),
         token_amount,
@@ -171,6 +182,7 @@ pub fn handler<'info>(
         to_bond,
         to_vault,
         to_operator,
+        to_local_partner,
         to_issuer,
         required,
         ts.distribution_ratio_bps
@@ -261,6 +273,20 @@ pub struct ConvertFees<'info> {
     /// The operator treasury (fixed in Config).
     #[account(mut, address = config.treasury @ TorusError::Unauthorized)]
     pub treasury: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The company's local partner (set by the operator with set_issuer_terms).
+    #[account(
+        seeds = [LOCAL_PARTNER_SEED, token_state.local_partner.as_ref()],
+        bump = local_partner_record.bump,
+    )]
+    pub local_partner_record: Box<Account<'info, LocalPartnerRecord>>,
+
+    /// The local partner's USDC account (fixed at its registration, where its mint and owner were checked). It is paid only
+    /// while the partner is active, so a revoked partner that has closed it cannot stop conversions.
+    /// CHECK: bound to the registered address; used only as the destination of the partner's share, which the token
+    /// program checks when it pays.
+    #[account(mut, address = local_partner_record.usdc_account @ TorusError::Unauthorized)]
+    pub local_partner_usdc: UncheckedAccount<'info>,
 
     /// Token program of the brand token: Token-2022.
     #[account(

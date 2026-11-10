@@ -44,9 +44,20 @@ export const SEEDS = {
   outcome: Buffer.from("outcome"),
   attest: Buffer.from("attest"),
   liq: Buffer.from("liq"),
+  withdrawal: Buffer.from("withdrawal"),
+  taxAccountant: Buffer.from("tax_accountant"),
+  taxReport: Buffer.from("tax_report"),
+  localPartner: Buffer.from("local_partner"),
+  perkTerms: Buffer.from("perk_terms"),
+  perkPeriod: Buffer.from("perk_period"),
+  merchant: Buffer.from("merchant"),
+  holderPerk: Buffer.from("holder_perk"),
+  perkReceipt: Buffer.from("perk"),
+  perkLot: Buffer.from("perk_lot"),
   // hook side
   extraAccountMetas: Buffer.from("extra-account-metas"),
   volume: Buffer.from("volume"),
+  holder: Buffer.from("holder"),
 };
 
 /** period_id (u64) as an 8-byte LE Buffer. */
@@ -99,7 +110,7 @@ export class TorusPdas {
     idx.writeUInt32LE(index >>> 0, 0);
     return PublicKey.findProgramAddressSync([SEEDS.claim, audit.toBuffer(), idx], this.protocolprogramId);
   }
-  /** Issuer escrow (USDC); not withdrawable until the audit finalizes without fraud. */
+  /** Issuer escrow (USDC); spent only through withdrawal requests approved by the escrow partner and the auditor. */
   issuerEscrow(mint: PublicKey): [PublicKey, number] {
     return PublicKey.findProgramAddressSync([SEEDS.issuerEscrow, mint.toBuffer()], this.protocolprogramId);
   }
@@ -123,6 +134,10 @@ export class TorusPdas {
   liquidationClaim(audit: PublicKey, index: number): [PublicKey, number] {
     return PublicKey.findProgramAddressSync([SEEDS.liq, audit.toBuffer(), u32le(index)], this.protocolprogramId);
   }
+  /** Withdrawal request from the issuer escrow (one per invoice hash). */
+  withdrawal(mint: PublicKey, invoiceHash: Buffer | Uint8Array | number[]): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.withdrawal, mint.toBuffer(), Buffer.from(invoiceHash as any)], this.protocolprogramId);
+  }
   /** This program's ProgramData (initialize checks the upgrade authority against it). */
   programData(): PublicKey {
     return PublicKey.findProgramAddressSync([this.protocolprogramId.toBuffer()], BPF_LOADER_UPGRADEABLE_ID)[0];
@@ -133,6 +148,49 @@ export class TorusPdas {
   }
   volumeCounter(mint: PublicKey): [PublicKey, number] {
     return PublicKey.findProgramAddressSync([SEEDS.volume, mint.toBuffer()], this.hookProgramId);
+  }
+  /** The hook's record of a registered token account (stamp, lowest balance, volume sent). */
+  holder(tokenAccount: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.holder, tokenAccount.toBuffer()], this.hookProgramId);
+  }
+  taxAccountant(mint: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.taxAccountant, mint.toBuffer()], this.protocolprogramId);
+  }
+  taxReport(mint: PublicKey, periodId: number | bigint | BN): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [SEEDS.taxReport, mint.toBuffer(), periodIdLe(periodId)],
+      this.protocolprogramId,
+    );
+  }
+  localPartner(partner: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.localPartner, partner.toBuffer()], this.protocolprogramId);
+  }
+  perkTerms(mint: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.perkTerms, mint.toBuffer()], this.protocolprogramId);
+  }
+  perkPeriod(mint: PublicKey, periodId: number | bigint | BN): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [SEEDS.perkPeriod, mint.toBuffer(), periodIdLe(periodId)],
+      this.protocolprogramId,
+    );
+  }
+  merchant(mint: PublicKey, merchant: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.merchant, mint.toBuffer(), merchant.toBuffer()], this.protocolprogramId);
+  }
+  holderPerk(tokenAccount: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.holderPerk, tokenAccount.toBuffer()], this.protocolprogramId);
+  }
+  perkReceipt(mint: PublicKey, receiptId: Buffer | Uint8Array | number[]): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [SEEDS.perkReceipt, mint.toBuffer(), Buffer.from(receiptId as any)],
+      this.protocolprogramId,
+    );
+  }
+  perkLot(mint: PublicKey, periodId: number | bigint | BN, tokenAccount: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [SEEDS.perkLot, mint.toBuffer(), periodIdLe(periodId), tokenAccount.toBuffer()],
+      this.protocolprogramId,
+    );
   }
 }
 
@@ -347,10 +405,19 @@ export class TorusClient {
     treasury: PublicKey, // operator treasury (USDC)
     minSampleSize: number,
     minBondTarget: BN, // minimum bond target (set by the operator)
+    taxHoldPeriod: BN, // seconds a cycle waits for the tax accountant's reconciled report
   ) {
     const [config] = this.pdas.config();
     return this.program.methods
-      .initialize(usdcMint, hookProgram, slashDestination, treasury, minSampleSize, minBondTarget)
+      .initialize(
+        usdcMint,
+        hookProgram,
+        slashDestination,
+        treasury,
+        minSampleSize,
+        minBondTarget,
+        taxHoldPeriod,
+      )
       .accounts({
         authority,
         program: this.program.programId,
@@ -426,6 +493,8 @@ export class TorusClient {
     sampleSize: number;
     /** Allowed defects (at most 20% of the sample). More defects = overstatement. Default 0. */
     maxDefects?: number;
+    /** Hash of the use plan for the issuer escrow (items and caps are an off-chain document). Default: none (zeros). */
+    usePlanHash?: number[];
   }) {
     const [tokenState] = this.pdas.tokenState(params.mint);
     const [manifest] = this.pdas.manifest(params.mint);
@@ -439,6 +508,7 @@ export class TorusClient {
         params.termLen,
         params.sampleSize,
         params.maxDefects ?? 0,
+        params.usePlanHash ?? Array(32).fill(0),
       )
       .accounts({
         issuer: params.issuer,
@@ -572,6 +642,7 @@ export class TorusClient {
           tokenState,
           manifest,
           audit,
+          taxReport: this.pdas.taxReport(params.mint, periodId)[0],
           poolAuthority,
           slashingBond,
           issuerEscrow: this.pdas.issuerEscrow(params.mint)[0],
@@ -685,14 +756,25 @@ export class TorusClient {
       .instruction();
   }
 
-  /** Terms the operator sets per company: bond target and minimum conversion price (Config.authority only). */
-  async setIssuerTerms(params: { authority: PublicKey; mint: PublicKey; bondTarget: BN; minConversionPrice: BN }) {
+  /**
+   * Terms the operator sets per company (Config.authority only): bond target, minimum conversion price, the issuer's
+   * share for ranks 0..3 (bps, never lower for a higher rank) and the local partner (registered and active).
+   */
+  async setIssuerTerms(params: {
+    authority: PublicKey;
+    mint: PublicKey;
+    bondTarget: BN;
+    minConversionPrice: BN;
+    tierShareBps: number[];
+    localPartner: PublicKey;
+  }) {
     return this.program.methods
-      .setIssuerTerms(params.bondTarget, params.minConversionPrice)
+      .setIssuerTerms(params.bondTarget, params.minConversionPrice, params.tierShareBps)
       .accounts({
         authority: params.authority,
         config: this.pdas.config()[0],
         tokenState: this.pdas.tokenState(params.mint)[0],
+        localPartnerRecord: this.pdas.localPartner(params.localPartner)[0],
       })
       .instruction();
   }
@@ -712,15 +794,18 @@ export class TorusClient {
   }
 
   /**
-   * Extra accounts for the fee_vault → partner transfer to pass through the transfer hook
-   * (the order registered in the ExtraAccountMetaList: torus-protocol, TokenState, VolumeCounter, plus the hook and the meta list).
+   * Extra accounts for a transfer source → destination made by a program to pass through the transfer hook (the order
+   * registered in the ExtraAccountMetaList: torus-protocol, TokenState, VolumeCounter, the HolderRecords of both
+   * accounts, plus the hook and the meta list).
    */
-  hookTransferAccounts(mint: PublicKey) {
+  hookTransferAccounts(mint: PublicKey, source: PublicKey, destination: PublicKey) {
     return [
       { pubkey: this.pdas.extraAccountMetaList(mint)[0], isSigner: false, isWritable: false },
       { pubkey: this.program.programId, isSigner: false, isWritable: false },
       { pubkey: this.pdas.tokenState(mint)[0], isSigner: false, isWritable: true },
       { pubkey: this.pdas.volumeCounter(mint)[0], isSigner: false, isWritable: true },
+      { pubkey: this.pdas.holder(source)[0], isSigner: false, isWritable: true },
+      { pubkey: this.pdas.holder(destination)[0], isSigner: false, isWritable: true },
       { pubkey: this.hook.programId, isSigner: false, isWritable: false },
     ];
   }
@@ -741,7 +826,15 @@ export class TorusClient {
     usdcTokenProgram: PublicKey;
     tokenAmount: BN;
     usdcAmount: BN;
+    /** The company's local partner (TokenState.local_partner); read from the chain when omitted. */
+    localPartner?: PublicKey;
   }) {
+    const [tokenState] = this.pdas.tokenState(params.mint);
+    const localPartner =
+      params.localPartner ?? ((await (this.program.account as any).tokenState.fetch(tokenState)).localPartner as PublicKey);
+    const [localPartnerRecord] = this.pdas.localPartner(localPartner);
+    const lp: any = await (this.program.account as any).localPartnerRecord.fetchNullable(localPartnerRecord);
+    const [feeVault] = this.pdas.feeVault(params.mint);
     return this.program.methods
       .convertFees(params.tokenAmount, params.usdcAmount)
       .accounts({
@@ -761,32 +854,13 @@ export class TorusClient {
         redemptionVault: this.pdas.redemptionVault(params.mint)[0],
         issuerEscrow: this.pdas.issuerEscrow(params.mint)[0],
         treasury: params.treasury,
+        localPartnerRecord,
+        // Unset terms: the record does not exist and the program rejects the conversion.
+        localPartnerUsdc: lp?.usdcAccount ?? params.treasury,
         tokenProgram: TOKEN_2022_PROGRAM_ID,
         usdcTokenProgram: params.usdcTokenProgram,
       })
-      .remainingAccounts(this.hookTransferAccounts(params.mint))
-      .instruction();
-  }
-
-  /** Pays the issuer share that passed a clean audit to the issuer's USDC account (anyone). */
-  async claimDistribution(params: {
-    crank: PublicKey;
-    mint: PublicKey;
-    issuerUsdc: PublicKey; // a USDC account owned by the issuer
-    usdcMint: PublicKey;
-    usdcTokenProgram: PublicKey;
-  }) {
-    return this.program.methods
-      .claimDistribution()
-      .accounts({
-        crank: params.crank,
-        tokenState: this.pdas.tokenState(params.mint)[0],
-        poolAuthority: this.pdas.poolAuthority(params.mint)[0],
-        issuerEscrow: this.pdas.issuerEscrow(params.mint)[0],
-        issuerUsdc: params.issuerUsdc,
-        usdcMint: params.usdcMint,
-        usdcTokenProgram: params.usdcTokenProgram,
-      })
+      .remainingAccounts(this.hookTransferAccounts(params.mint, feeVault, params.partnerToken))
       .instruction();
   }
 
@@ -876,12 +950,14 @@ export class TorusClient {
     return this.program.methods.requestExit().accounts({ issuer, tokenState: this.pdas.tokenState(mint)[0] }).instruction();
   }
 
-  /** Finalizes a voluntary exit (anyone). If the current budget > 0, pass the current audit cycle as `audit`. */
+  /**
+   * Finalizes a voluntary exit (anyone). If the current budget > 0, pass the current audit cycle as `audit`.
+   * The issuer's half of the bond and what is left in the escrow go to the redemption pool (customers, through liquidation).
+   */
   async finalizeExit(params: {
     crank: PublicKey;
     mint: PublicKey;
     audit: PublicKey | null;
-    issuerUsdc: PublicKey;
     treasury: PublicKey;
     usdcMint: PublicKey;
     usdcTokenProgram: PublicKey;
@@ -895,7 +971,8 @@ export class TorusClient {
         audit: params.audit,
         poolAuthority: this.pdas.poolAuthority(params.mint)[0],
         slashingBond: this.pdas.slashingBond(params.mint)[0],
-        issuerUsdc: params.issuerUsdc,
+        redemptionVault: this.pdas.redemptionVault(params.mint)[0],
+        issuerEscrow: this.pdas.issuerEscrow(params.mint)[0],
         treasury: params.treasury,
         usdcMint: params.usdcMint,
         usdcTokenProgram: params.usdcTokenProgram,
@@ -952,6 +1029,90 @@ export class TorusClient {
         usdcMint: params.usdcMint,
         usdcTokenProgram: params.usdcTokenProgram,
         systemProgram: web3.SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /** Revokes an exchange partner's registration (Config.authority only; permanent). */
+  async revokePartner(authority: PublicKey, partner: PublicKey) {
+    return this.program.methods
+      .revokePartner()
+      .accounts({ authority, config: this.pdas.config()[0], partnerRecord: this.pdas.partnerRecord(partner)[0] })
+      .instruction();
+  }
+
+  /**
+   * The issuer picks the registered partner that manages its escrow. Locked during a campaign unless the current
+   * partner's registration was revoked (then pass `currentPartner`).
+   */
+  async setEscrowPartner(params: { issuer: PublicKey; mint: PublicKey; partner: PublicKey; currentPartner?: PublicKey | null }) {
+    return this.program.methods
+      .setEscrowPartner()
+      .accounts({
+        issuer: params.issuer,
+        config: this.pdas.config()[0],
+        tokenState: this.pdas.tokenState(params.mint)[0],
+        manifest: this.pdas.manifest(params.mint)[0],
+        partner: params.partner,
+        partnerRecord: this.pdas.partnerRecord(params.partner)[0],
+        currentPartnerRecord: params.currentPartner ? this.pdas.partnerRecord(params.currentPartner)[0] : null,
+      })
+      .instruction();
+  }
+
+  /**
+   * The issuer requests a payment from its escrow: an item of the use plan, the amount (at most the balance released by
+   * clean audits), the payee's USDC account (not the issuer's) and the invoice hash (used once).
+   * With `fromBond` the payment comes from the bond instead, which must keep at least half of its target.
+   */
+  async requestWithdrawal(params: {
+    issuer: PublicKey;
+    mint: PublicKey;
+    planItem: number;
+    amount: BN;
+    payee: PublicKey;
+    invoiceHash: number[];
+    fromBond?: boolean;
+  }) {
+    return this.program.methods
+      .requestWithdrawal(params.planItem, params.amount, params.invoiceHash, params.fromBond ?? false)
+      .accounts({
+        issuer: params.issuer,
+        tokenState: this.pdas.tokenState(params.mint)[0],
+        manifest: this.pdas.manifest(params.mint)[0],
+        slashingBond: this.pdas.slashingBond(params.mint)[0],
+        payee: params.payee,
+        request: this.pdas.withdrawal(params.mint, params.invoiceHash)[0],
+        systemProgram: web3.SystemProgram.programId,
+      })
+      .instruction();
+  }
+
+  /**
+   * The escrow partner or the manifest's auditor approves a request. The second of the two approvals pays the payee
+   * straight from the escrow. Nobody else (not the operator, not the issuer) can approve.
+   */
+  async approveWithdrawal(params: { approver: PublicKey; mint: PublicKey; invoiceHash: number[]; usdcMint: PublicKey; usdcTokenProgram: PublicKey }) {
+    const ts: any = await (this.program.account as any).tokenState.fetch(this.pdas.tokenState(params.mint)[0]);
+    const m: any = await (this.program.account as any).manifest.fetch(this.pdas.manifest(params.mint)[0]);
+    const [request] = this.pdas.withdrawal(params.mint, params.invoiceHash);
+    const req: any = await (this.program.account as any).withdrawalRequest.fetch(request);
+    return this.program.methods
+      .approveWithdrawal()
+      .accounts({
+        approver: params.approver,
+        config: this.pdas.config()[0],
+        tokenState: this.pdas.tokenState(params.mint)[0],
+        manifest: this.pdas.manifest(params.mint)[0],
+        request,
+        partnerRecord: this.pdas.partnerRecord(ts.escrowPartner)[0],
+        auditorRecord: this.pdas.auditorRecord(m.auditor)[0],
+        poolAuthority: this.pdas.poolAuthority(params.mint)[0],
+        issuerEscrow: this.pdas.issuerEscrow(params.mint)[0],
+        slashingBond: this.pdas.slashingBond(params.mint)[0],
+        payee: req.payee,
+        usdcMint: params.usdcMint,
+        usdcTokenProgram: params.usdcTokenProgram,
       })
       .instruction();
   }

@@ -107,6 +107,10 @@ const SAMPLE = 4;
 const MIN_BOND = u(1_000); // operator's floor for any bond target (fixed at initialize)
 const BOND_TARGET = u(2_000); // set by the operator for this company
 const MIN_PRICE = u(1); // a partner pays at least 1 USDC per brand token
+const TIER_SHARES = [2_000, 3_500, 5_000, 6_500]; // the issuer's share per rank, negotiated with this company
+const TAX_HOLD = 7 * 86_400; // a cycle waits a week for the tax accountant's reconciled report (fixed at initialize)
+const TAX_BOOK = u(1_000_000_000); // the books cover every declared total in the demo
+const ALICE_SUPPLY = u(3_000_000); // minted to alice before issuance (afterwards only restamp mints)
 const UNIQ_BATCH = 6;
 
 // The company's ledger of delivered returns for one period: who was paid, for which payment.
@@ -267,6 +271,8 @@ interface Cast {
   partner: Keypair; // registered exchange partner that buys the collected fees for USDC
   compPool: Keypair; // owner of the compensation pool (slash destination)
   treasury: Keypair; // owner of the operator's treasury
+  taxAccountant: Keypair; // the company's tax accountant (files the book totals)
+  localPartner: Keypair; // the company's local partner (share 0 in the demo)
   usdcMint?: string;
 }
 const statePath = path.join(root, "demo", ".state", DEVNET ? "devnet.json" : "none.json");
@@ -279,6 +285,8 @@ function loadCast(): Cast {
     partner: kp(saved.partner),
     compPool: kp(saved.compPool),
     treasury: kp(saved.treasury),
+    taxAccountant: kp(saved.taxAccountant),
+    localPartner: kp(saved.localPartner),
     usdcMint: saved.usdcMint,
   };
 }
@@ -294,6 +302,8 @@ function saveCast(cast: Cast) {
       partner: sk(cast.partner),
       compPool: sk(cast.compPool),
       treasury: sk(cast.treasury),
+      taxAccountant: sk(cast.taxAccountant),
+      localPartner: sk(cast.localPartner),
       usdcMint: cast.usdcMint,
     }),
   );
@@ -366,7 +376,15 @@ async function setupChain() {
   if (!configExists) {
     // Only the program's upgrade authority (the operator) can initialize the protocol.
     await pm
-      .initialize(usdcMint, hook.programId, compPoolUsdc, treasuryUsdc, SAMPLE, new BN(MIN_BOND.toString()))
+      .initialize(
+        usdcMint,
+        hook.programId,
+        compPoolUsdc,
+        treasuryUsdc,
+        SAMPLE,
+        new BN(MIN_BOND.toString()),
+        new BN(TAX_HOLD),
+      )
       .accounts({
         authority: operator.publicKey,
         program: program.programId,
@@ -396,6 +414,23 @@ async function setupChain() {
       })
       .rpc();
   }
+  // The local partner (share 0 in the demo)
+  const lp = cast.localPartner.publicKey;
+  if (!(await accounts.localPartnerRecord.fetchNullable(pdas.localPartner(lp)[0]))) {
+    await pm
+      .registerLocalPartner(0)
+      .accounts({
+        authority: operator.publicKey,
+        config: pdas.config()[0],
+        partner: lp,
+        partnerUsdc: await ataOf(lp),
+        localPartnerRecord: pdas.localPartner(lp)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+  }
+  // The tax accountant's SOL for its reports
+  await fund(cast.taxAccountant.publicKey, 1);
   saveCast(cast);
 }
 
@@ -424,6 +459,10 @@ async function createBrandMint(opts: { freezeAuthority?: boolean } = {}): Promis
     createInitializeMintInstruction(mintKp.publicKey, DEC, company.publicKey, opts.freezeAuthority ? company.publicKey : null, TOKEN_2022_PROGRAM_ID),
   );
   await sendAndConfirmTransaction(connection, tx, [company, mintKp]);
+  // Supply for the customers, minted before issuance (issue_token moves the mint authority to the program).
+  await mintToChecked(
+    connection, operator, mintKp.publicKey, await ata(mintKp.publicKey, alice.publicKey), company, ALICE_SUPPLY, DEC, [], undefined, TOKEN_2022_PROGRAM_ID,
+  );
   await (hook.methods as any)
     .initializeExtraAccountMetaList()
     .accounts({
@@ -462,7 +501,7 @@ async function issue(mint: PublicKey): Promise<string> {
 
 async function setManifest(mint: PublicKey, auditorKey: PublicKey, periodLen = PERIOD_LEN) {
   return pm
-    .setManifest(RETURN_RATE_BPS, TOLERANCE_BPS, LCL_BPS, FLOOR_BPS, new BN(periodLen), new BN(TERM_LEN), SAMPLE, 0)
+    .setManifest(RETURN_RATE_BPS, TOLERANCE_BPS, LCL_BPS, FLOOR_BPS, new BN(periodLen), new BN(TERM_LEN), SAMPLE, 0, Array(32).fill(0))
     .accounts({
       issuer: company.publicKey,
       tokenState: pdas.tokenState(mint)[0],
@@ -477,10 +516,49 @@ async function setManifest(mint: PublicKey, auditorKey: PublicKey, periodLen = P
 }
 
 async function setTerms(mint: PublicKey, signer: Keypair = operator) {
-  return pm
-    .setIssuerTerms(new BN(BOND_TARGET.toString()), new BN(MIN_PRICE.toString()))
-    .accounts({ authority: signer.publicKey, config: pdas.config()[0], tokenState: pdas.tokenState(mint)[0] })
+  const sig = await pm
+    .setIssuerTerms(new BN(BOND_TARGET.toString()), new BN(MIN_PRICE.toString()), TIER_SHARES)
+    .accounts({
+      authority: signer.publicKey,
+      config: pdas.config()[0],
+      tokenState: pdas.tokenState(mint)[0],
+      localPartnerRecord: pdas.localPartner(cast.localPartner.publicKey)[0],
+    })
     .signers(signer === operator ? [] : [signer])
+    .rpc();
+  // The company's tax accountant: registered by the operator with the accountant's signature.
+  if (!(await accounts.taxAccountantRecord.fetchNullable(pdas.taxAccountant(mint)[0]))) {
+    await pm
+      .registerTaxAccountant(Array(32).fill(0))
+      .accounts({
+        authority: operator.publicKey,
+        config: pdas.config()[0],
+        tokenState: pdas.tokenState(mint)[0],
+        accountant: cast.taxAccountant.publicKey,
+        taxAccountantRecord: pdas.taxAccountant(mint)[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([cast.taxAccountant])
+      .rpc();
+  }
+  return sig;
+}
+
+/** The tax accountant reports the book total for the cycle just provisioned. */
+async function fileTaxReport(mint: PublicKey) {
+  const ts = await tokenState(mint);
+  if ((ts.budget as BN).eqn(0)) return;
+  await pm
+    .fileTaxReport(new BN(TAX_BOOK.toString()), Array(32).fill(0))
+    .accounts({
+      accountant: cast.taxAccountant.publicKey,
+      tokenState: pdas.tokenState(mint)[0],
+      taxAccountantRecord: pdas.taxAccountant(mint)[0],
+      audit: pdas.audit(mint, ts.periodId)[0],
+      taxReport: pdas.taxReport(mint, ts.periodId)[0],
+      systemProgram: SystemProgram.programId,
+    })
+    .signers([cast.taxAccountant])
     .rpc();
 }
 
@@ -502,10 +580,6 @@ async function deposit(mint: PublicKey, amount: bigint) {
 
 async function ata(mint: PublicKey, owner: PublicKey) {
   return createAssociatedTokenAccountIdempotent(connection, operator, mint, owner, undefined, TOKEN_2022_PROGRAM_ID);
-}
-
-async function mintBrand(mint: PublicKey, to: PublicKey, amount: bigint) {
-  await mintToChecked(connection, operator, mint, await ata(mint, to), company, amount, DEC, [], undefined, TOKEN_2022_PROGRAM_ID);
 }
 
 /** A customer-to-customer transfer: Token-2022 withholds the fee; the hook counts the volume. */
@@ -592,7 +666,7 @@ async function provision(mint: PublicKey): Promise<string> {
   const ts = await tokenState(mint);
   const pid: BN = ts.periodId;
   const prevAudit = pid.gtn(0) && (ts.budget as BN).gtn(0) ? pdas.audit(mint, pid)[0] : null;
-  return pm
+  const sig = await pm
     .provisionBudget()
     .accounts({
       crank: operator.publicKey,
@@ -604,6 +678,8 @@ async function provision(mint: PublicKey): Promise<string> {
       prevAudit,
     })
     .rpc();
+  await fileTaxReport(mint);
+  return sig;
 }
 
 /** Closes periods until one with trading volume gets an obligation (empty periods are skipped). */
@@ -693,6 +769,7 @@ async function finalize(mint: PublicKey, periodId: BN) {
       tokenState: pdas.tokenState(mint)[0],
       manifest: pdas.manifest(mint)[0],
       audit: pdas.audit(mint, periodId)[0],
+      taxReport: pdas.taxReport(mint, periodId)[0],
       poolAuthority: pdas.poolAuthority(mint)[0],
       slashingBond: pdas.slashingBond(mint)[0],
       issuerEscrow: pdas.issuerEscrow(mint)[0],
@@ -767,7 +844,6 @@ async function quickLaunch(symbol: string): Promise<{ mint: PublicKey; periodId:
   await setTerms(mint);
   await deposit(mint, BOND_TARGET + u(1_500)); // bond first, the rest to the redemption pool
   await provision(mint); // bond is full → metering starts here
-  await mintBrand(mint, alice.publicKey, u(1_000_000));
   const dst = await trade(mint, alice, bob.publicKey, u(500_000));
   await harvest(mint, [dst]);
   const p = await provisionUntilBudget(mint);
@@ -852,7 +928,6 @@ async function scene2() {
   }
   const mint = hero.mint;
 
-  await mintBrand(mint, alice.publicKey, u(2_000_000));
   await step("Customers trade ACME");
   const withheld: PublicKey[] = [];
   for (const [from, to, amt, label] of [
