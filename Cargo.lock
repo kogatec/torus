@@ -2832,6 +2832,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "torus-venue"
+version = "0.1.0"
+dependencies = [
+ "solana-program",
+ "spl-pod",
+ "spl-token-2022",
+]
+
+[[package]]
+name = "torus-venue-example"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "torus-venue",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

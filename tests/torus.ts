@@ -88,6 +88,20 @@
  *   (bi) a freeze stops listing; the lot can still be closed
  *   (bj) a local partner's share lowers what can be listed; a revoked partner's does not
  *   (bk) an account that changes hands mid-period cannot redirect its lot
+ *   Sampling and the partner's signature (2026-11-12):
+ *   (bl) a fabricated entry holding most of the total is sampled in proportion to its value (drawn by index, with the
+ *        entropy supplied by the operator, it used to pass)
+ *   (bm) nobody picks the sample alone: the slot hash is captured after the commitment, only the operator's committed
+ *        seed fixes the sample within the grace, and afterwards anyone continues without it with a doubled sample
+ *   (bn) the local partner signs for the company it takes on: the operator cannot assign a company in its place
+ *   The partner issues; obligations are counted in money (2026-11-13):
+ *   (bo) the local partner issues the token (its signature, its mint authority); the company is named as the obligor
+ *   (bp) the obligation is the period's volume × the return rate valued at the rate its fees were converted at
+ *   Periods the issuer could not deliver in (2026-11-23):
+ *   (bs) a period provisioned after its window because someone else held up the previous cycle is excused (not judged,
+ *        tier and streak kept), and its obligation is carried but never judged again
+ *   (bt) the cycle's auditor excuses a share of the obligation with the hash of its reasons; only it, at most 100%, and
+ *        not after finalization
  *
  * Claimed values (per sample and in total) are not reported by anyone: they are fixed on-chain by disclosure proofs
  * (verify_disclosure) against the Merkle sum tree, one per sample. The auditor records an observed value per sample and
@@ -102,6 +116,7 @@ import {
   PublicKey,
   SystemProgram,
   SYSVAR_RENT_PUBKEY,
+  SYSVAR_SLOT_HASHES_PUBKEY,
   Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
@@ -133,7 +148,7 @@ import {
 } from "@solana/spl-token";
 import { assert } from "chai";
 import { keccak_256 } from "@noble/hashes/sha3";
-import { TorusClient, SumTree, distributeLeafValues, sortByOutcome, ROOT_TAG } from "../app/src/sdk";
+import { TorusClient, SumTree, distributeLeafValues, sortByOutcome, seedCommitment, ROOT_TAG } from "../app/src/sdk";
 
 const BPS = 10_000;
 const DECIMALS = 6;
@@ -156,6 +171,14 @@ const MAX_FEE = 1_000_000;
 // The operator's minimum sample size and the sample size fixed in the manifest.
 const MIN_SAMPLE = 4;
 const SAMPLE = 4;
+// Slots the operator has to reveal its seed before anyone may fix the sample without it (fixed at initialize). Short in tests.
+const REVEAL_GRACE = 40;
+// Fee-funded tests sell fee tokens at 500 USDC units per token unit (10_000 → 5_000_000). Volume is valued at that
+// rate, so a 0.1% return there is the same obligation as 50% at one USDC per token: VOLUME × 0.1% × 500 = OBLIGATION.
+const FEE_PRICE = 500;
+const FEE_FUNDED = { returnRateBps: 5_000 / FEE_PRICE, floorBps: 5_000 / FEE_PRICE };
+// Hash of the terms a local partner accepts when it takes a company on (the document is kept off-chain).
+const PARTNER_TERMS = Array.from(keccak_256(Buffer.from("partner terms v1")));
 // Leaves per transaction for the uniqueness check, observations per transaction.
 const UNIQ_BATCH = 6;
 const OBS_BATCH = 32;
@@ -203,6 +226,8 @@ describe("torus-protocol lifecycle", () => {
   const issuer = authority; // simplification: issuer = operator
   const auditor = Keypair.generate();
   const auditor2 = Keypair.generate(); // (w) replacement auditor
+  /** Keys of every registered auditor: a cycle's auditor is drawn from the registry when its sample is fixed. */
+  const auditorKeys = new Map<string, Keypair>();
   const slashDest = Keypair.generate();
   const treasuryOwner = Keypair.generate(); // owner of the operator treasury
   const partner = Keypair.generate(); // exchange partner
@@ -295,6 +320,7 @@ describe("torus-protocol lifecycle", () => {
           treasuryAta,
           MIN_SAMPLE,
           MIN_BOND,
+          new BN(REVEAL_GRACE),
           new BN(TAX_HOLD),
         )
         .accounts({
@@ -319,6 +345,7 @@ describe("torus-protocol lifecycle", () => {
         treasuryAta,
         MIN_SAMPLE,
         MIN_BOND,
+        new BN(REVEAL_GRACE),
         new BN(TAX_HOLD),
       )
       .accounts({
@@ -331,19 +358,7 @@ describe("torus-protocol lifecycle", () => {
       .rpc();
 
     // Register the auditors in the operator's registry
-    for (const a of [auditor, auditor2]) {
-      await program.methods
-        .registerAuditor()
-        .accounts({
-          authority: authority.publicKey,
-          config: client.pdas.config()[0],
-          auditor: a.publicKey,
-          auditorRecord: client.pdas.auditorRecord(a.publicKey)[0],
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-      await airdrop(a.publicKey, 2);
-    }
+    for (const a of [auditor, auditor2]) await registerAuditorTx(a);
 
     // Register the exchange partner and give it USDC to pay with
     await program.methods
@@ -432,7 +447,7 @@ describe("torus-protocol lifecycle", () => {
     permanentDelegate?: PublicKey;
     feeConfigAuthority?: PublicKey | null;
     maxFee?: number;
-    /** Mint authority (= the issuer) when it is not the operator's key. */
+    /** Mint authority when it is not the local partner (to probe registering someone else's mint). */
     mintAuthority?: Keypair;
   }
 
@@ -481,7 +496,7 @@ describe("torus-protocol lifecycle", () => {
     }
     tx.add(
       createInitializeMintInstruction(
-        mintKp.publicKey, DECIMALS, (opts.mintAuthority ?? authority).publicKey, opts.freezeAuthority ?? null, TOKEN_2022_PROGRAM_ID,
+        mintKp.publicKey, DECIMALS, (opts.mintAuthority ?? localPartner).publicKey, opts.freezeAuthority ?? null, TOKEN_2022_PROGRAM_ID,
       ),
     );
     await sendAndConfirmTransaction(connection, tx, [authority, mintKp]);
@@ -490,7 +505,7 @@ describe("torus-protocol lifecycle", () => {
       connection, authority, mintKp.publicKey, authority.publicKey, undefined, TOKEN_2022_PROGRAM_ID,
     );
     await mintToChecked(
-      connection, authority, mintKp.publicKey, supplyAta, opts.mintAuthority ?? authority, SUPPLY, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID,
+      connection, authority, mintKp.publicKey, supplyAta, opts.mintAuthority ?? localPartner, SUPPLY, DECIMALS, [], undefined, TOKEN_2022_PROGRAM_ID,
     );
 
     await hook.methods
@@ -507,11 +522,14 @@ describe("torus-protocol lifecycle", () => {
     return mintKp.publicKey;
   }
 
-  function issueTokenTx(mint: PublicKey, signer: Keypair = issuer, feeBps = FEE_BPS, maxFee = MAX_FEE) {
+  /** The local partner (the mint authority) registers the mint for `company`, the obligor. Only the partner signs. */
+  function issueTokenTx(mint: PublicKey, company: Keypair = issuer, feeBps = FEE_BPS, maxFee = MAX_FEE, partnerKey: Keypair = localPartner) {
     return program.methods
       .issueToken(feeBps, new BN(maxFee))
       .accounts({
-        issuer: signer.publicKey,
+        partner: partnerKey.publicKey,
+        localPartnerRecord: client.pdas.localPartner(partnerKey.publicKey)[0],
+        company: company.publicKey,
         config: client.pdas.config()[0],
         mint,
         usdcMint,
@@ -526,7 +544,7 @@ describe("torus-protocol lifecycle", () => {
         systemProgram: SystemProgram.programId,
         rent: SYSVAR_RENT_PUBKEY,
       })
-      .signers(signer === issuer ? [] : [signer])
+      .signers([partnerKey])
       .rpc();
   }
 
@@ -646,24 +664,45 @@ describe("torus-protocol lifecycle", () => {
    * Terms the operator sets per company (bond target, minimum conversion price, share per rank, local partner).
    * Once they are set, the company's tax accountant is registered too.
    */
+  /** The operator's seed for a token's `round`-th sample (derived here so tests can replay it; secret in production). */
+  function auditSeed(mint: PublicKey, round: number): number[] {
+    return Array.from(keccak_256(Buffer.concat([Buffer.from("test audit seed"), mint.toBuffer(), Buffer.from([round & 0xff, round >> 8])])));
+  }
+
+  /** Seeds revealed so far, per mint: the next sample uses auditSeed(mint, that number). */
+  const seedRound = new Map<string, number>();
+
+  /** The operator posts the commitment to a token's first seed, once (no period closes before it is posted). */
+  async function ensureAuditSeed(mint: PublicKey) {
+    if (seedRound.has(mint.toBase58())) return;
+    await program.methods
+      .setAuditSeed(seedCommitment(auditSeed(mint, 0)))
+      .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], tokenState: client.pdas.tokenState(mint)[0] })
+      .rpc();
+    seedRound.set(mint.toBase58(), 0);
+  }
+
+  /** The operator sets a company's terms; its local partner signs that it takes the company on. */
   async function setTermsTx(
     mint: PublicKey,
     signer: Keypair = authority,
     bondTarget = BOND_TARGET,
     minPrice = MIN_PRICE,
     tiers = TIER_SHARES,
-    lp = localPartner.publicKey,
+    lp: Keypair = localPartner,
   ) {
     const sig = await program.methods
-      .setIssuerTerms(bondTarget, minPrice, tiers)
+      .setIssuerTerms(bondTarget, minPrice, tiers, PARTNER_TERMS)
       .accounts({
         authority: signer.publicKey,
         config: client.pdas.config()[0],
         tokenState: client.pdas.tokenState(mint)[0],
-        localPartnerRecord: client.pdas.localPartner(lp)[0],
+        localPartner: lp.publicKey,
+        localPartnerRecord: client.pdas.localPartner(lp.publicKey)[0],
       })
-      .signers(signer === authority ? [] : [signer])
+      .signers(signer === authority ? [lp] : [signer, lp])
       .rpc();
+    await ensureAuditSeed(mint);
     await ensureTaxAccountant(mint);
     return sig;
   }
@@ -685,7 +724,7 @@ describe("torus-protocol lifecycle", () => {
 
   /** mint → issue → manifest → operator terms → deposit (bond + redemption pool) → metering starts. */
   async function setupToken(m: ManifestOpts & { maxFee?: number; termLen?: BN; tiers?: number[] } = {}): Promise<PublicKey> {
-    const mint = await createTorusMint({ maxFee: m.maxFee, mintAuthority: m.issuer });
+    const mint = await createTorusMint({ maxFee: m.maxFee });
     await issueTokenTx(mint, m.issuer ?? issuer, FEE_BPS, m.maxFee ?? MAX_FEE);
     await setManifestTx(mint, m.termLen ?? TERM_LEN, m);
     await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, m.tiers ?? TIER_SHARES);
@@ -745,26 +784,57 @@ describe("torus-protocol lifecycle", () => {
     }
   }
 
+  /** Waits until the slot whose hash feeds the sample (fixed at commit, after it) has been produced. */
   async function waitAfterCommit(mint: PublicKey, periodId: BN) {
-    // The sample must be designated in a slot after the commitment.
     const committed: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
-    const committedSlot = (committed.committedSlot as BN).toNumber();
-    while ((await connection.getSlot("confirmed")) <= committedSlot) {
+    await waitSlot((committed.entropySlot as BN).toNumber());
+  }
+
+  /** Waits until the confirmed slot has passed `slot`. */
+  async function waitSlot(slot: number) {
+    while ((await connection.getSlot("confirmed")) <= slot) {
       await new Promise((r) => setTimeout(r, 200));
     }
   }
 
-  function designateTx(mint: PublicKey, periodId: BN, signer: Keypair = authority) {
+  /** Records the cycle's slot hash from the sysvar (anyone can crank it). */
+  function captureTx(mint: PublicKey, periodId: BN, signer: Keypair = authority) {
     return program.methods
-      .designateSample(Array(32).fill(7))
-      .accounts({ crank: signer.publicKey, config: client.pdas.config()[0], audit: client.pdas.audit(mint, periodId)[0] })
+      .captureEntropy()
+      .accounts({ crank: signer.publicKey, audit: client.pdas.audit(mint, periodId)[0], slotHashes: SYSVAR_SLOT_HASHES_PUBKEY })
       .signers(signer === authority ? [] : [signer])
       .rpc();
   }
 
-  async function sampledIndices(mint: PublicKey, periodId: BN): Promise<number[]> {
+  /** The operator reveals `seed` for the cycle and posts `nextCommit` for the one after. */
+  function revealTx(mint: PublicKey, periodId: BN, seed: number[], nextCommit: number[], signer: Keypair = authority) {
+    return program.methods
+      .designateSample(seed, nextCommit)
+      .accounts({
+        crank: signer.publicKey,
+        config: client.pdas.config()[0],
+        audit: client.pdas.audit(mint, periodId)[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        auditorRegistry: client.pdas.auditorRegistry()[0],
+      })
+      .signers(signer === authority ? [] : [signer])
+      .rpc();
+  }
+
+  /** Fixes the sample: capture the slot hash (unless already captured), then reveal the token's current seed. */
+  async function designateTx(mint: PublicKey, periodId: BN, signer: Keypair = authority) {
+    const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
+    if ((audit.capturedSlot as BN).isZero()) await captureTx(mint, periodId);
+    const round = seedRound.get(mint.toBase58()) ?? 0;
+    const sig = await revealTx(mint, periodId, auditSeed(mint, round), seedCommitment(auditSeed(mint, round + 1)), signer);
+    seedRound.set(mint.toBase58(), round + 1);
+    return sig;
+  }
+
+  /** Leaves the cycle's sample landed on, in sample order (from the entropy fixed on-chain; repeats allowed). */
+  async function sampledIndices(mint: PublicKey, periodId: BN, tree: SumTree): Promise<number[]> {
     const a: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
-    return (a.sampleIndices as any[]).map((i) => Number(i));
+    return tree.sampledLeaves(a.entropy, a.sampleSize);
   }
 
   /** provision → build ledger → commit → uniqueness → sample. Returns the tree and the sample for the proofs. */
@@ -782,23 +852,29 @@ describe("torus-protocol lifecycle", () => {
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
 
-    const sampleIndices = await sampledIndices(mint, periodId);
+    const sampleIndices = await sampledIndices(mint, periodId, tree);
     const m: any = await program.account.manifest.fetch(client.pdas.manifest(mint)[0]);
-    assert.equal(sampleIndices.length, Math.min(m.sampleSize, pop), "the sample size is the one fixed in the manifest");
+    // Drawn with replacement in proportion to value, so a small population does not shrink the sample.
+    assert.equal(sampleIndices.length, controlTotal > 0 ? m.sampleSize : 0, "the sample size is the one fixed in the manifest");
 
     return { periodId, budget, controlTotal, tree, sampleIndices };
+  }
+
+  /** Discloses leaf `index` of `tree` for the cycle's next sample. */
+  function discloseTx(mint: PublicKey, periodId: BN, tree: SumTree, index: number) {
+    const leaf = { index, outcomeId: tree.outcomeAt(index), beneficiary: tree.beneficiaryAt(index), value: new BN(tree.valueAt(index).toString()) };
+    return program.methods
+      .verifyDisclosure(leaf, tree.proof(index))
+      .accounts({ crank: authority.publicKey, audit: client.pdas.audit(mint, periodId)[0] })
+      .rpc();
   }
 
   /** Submits the sampled leaves' proofs in order and returns the claimed total fixed on-chain. */
   async function submitDisclosures(mint: PublicKey, periodId: BN, tree: SumTree, sampleIndices: number[]): Promise<bigint> {
     let asserted = 0n;
     for (const index of sampleIndices) {
-      const value = tree.valueAt(index);
-      await program.methods
-        .verifyDisclosure(tree.outcomeAt(index), tree.beneficiaryAt(index), new BN(value.toString()), tree.proof(index))
-        .accounts({ crank: authority.publicKey, audit: client.pdas.audit(mint, periodId)[0] })
-        .rpc();
-      asserted += value;
+      await discloseTx(mint, periodId, tree, index);
+      asserted += tree.valueAt(index);
     }
     const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
     assert.equal(audit.verifyCursor, sampleIndices.length, "all sampled leaves disclosed");
@@ -806,8 +882,37 @@ describe("torus-protocol lifecycle", () => {
     return asserted;
   }
 
-  /** The auditor records an observed value per sample (f maps claimed → observed). */
-  async function observe(mint: PublicKey, periodId: BN, signer: Keypair, f: (asserted: bigint, j: number) => bigint = (a) => a) {
+  /**
+   * Registers an auditor, funds it (it pays the fees of its leaf confirmations) and remembers its key: a cycle's auditor is
+   * drawn from the registry, so any registered auditor may have to sign.
+   */
+  async function registerAuditorTx(a: Keypair) {
+    await program.methods
+      .registerAuditor()
+      .accounts({
+        authority: authority.publicKey,
+        config: client.pdas.config()[0],
+        auditor: a.publicKey,
+        auditorRecord: client.pdas.auditorRecord(a.publicKey)[0],
+        auditorRegistry: client.pdas.auditorRegistry()[0],
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    auditorKeys.set(a.publicKey.toBase58(), a);
+    await airdrop(a.publicKey, 2);
+  }
+
+  /** The key of the auditor drawn for a cycle. */
+  async function cycleAuditor(mint: PublicKey, periodId: BN): Promise<Keypair> {
+    const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
+    const key = auditorKeys.get((audit.auditor as PublicKey).toBase58());
+    if (!key) throw new Error("the cycle's auditor is not one of the test's auditors");
+    return key;
+  }
+
+  /** The auditor records an observed value per sample (f maps claimed → observed). By default, the cycle's drawn auditor. */
+  async function observe(mint: PublicKey, periodId: BN, by: Keypair | undefined, f: (asserted: bigint, j: number) => bigint = (a) => a) {
+    const signer = by ?? (await cycleAuditor(mint, periodId));
     const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
     const observed = (audit.sampleValues as BN[]).map((v, j) => f(BigInt(v.toString()), j));
     for (let i = 0; i < observed.length; i += OBS_BATCH) {
@@ -853,7 +958,7 @@ describe("torus-protocol lifecycle", () => {
 
     await submitDisclosures(mint, periodId, tree, sampleIndices);
     // Attack X: observed = claimed / 10 (every sample defective, residual beyond tolerance).
-    await observe(mint, periodId, auditor, scenario === "attackX" ? (a) => a / 10n : (a) => a);
+    await observe(mint, periodId, undefined, scenario === "attackX" ? (a) => a / 10n : (a) => a);
 
     const bondBefore = Number((await getAccount(connection, client.pdas.slashingBond(mint)[0])).amount);
     const slashBefore = Number((await getAccount(connection, slashDestAta)).amount);
@@ -867,7 +972,8 @@ describe("torus-protocol lifecycle", () => {
   }
 
   /** The auditor confirms a leaf (by default its full value). */
-  async function attestTx(mint: PublicKey, periodId: BN, tree: SumTree, index: number, confirmed?: bigint, signer: Keypair = auditor) {
+  async function attestTx(mint: PublicKey, periodId: BN, tree: SumTree, index: number, confirmed?: bigint, by?: Keypair) {
+    const signer = by ?? (await cycleAuditor(mint, periodId));
     const ix = await client.attestLeaf({
       auditor: signer.publicKey,
       mint,
@@ -886,7 +992,7 @@ describe("torus-protocol lifecycle", () => {
 
   /** If the leaf was not observed in the sample, the auditor confirms its value. */
   async function confirmLeaf(mint: PublicKey, periodId: BN, tree: SumTree, index: number) {
-    if ((await sampledIndices(mint, periodId)).includes(index)) return;
+    if ((await sampledIndices(mint, periodId, tree)).includes(index)) return;
     if (await attestationIfAny(mint, periodId, index)) return;
     await attestTx(mint, periodId, tree, index);
   }
@@ -990,7 +1096,7 @@ describe("torus-protocol lifecycle", () => {
   });
 
   it("(d) issue_token rejects a mint without the Torus mechanism", async () => {
-    const plainMint = await createMint(connection, authority, authority.publicKey, null, DECIMALS, undefined, undefined, TOKEN_2022_PROGRAM_ID);
+    const plainMint = await createMint(connection, authority, localPartner.publicKey, null, DECIMALS, undefined, undefined, TOKEN_2022_PROGRAM_ID);
     const msg = await failure(issueTokenTx(plainMint));
     assert.isNotNull(msg, "a mint without the extensions must not be accepted");
     assert.match(msg!, /MissingTransferHook|HookProgramMismatch|MissingTransferFee/, "rejected for the missing extensions");
@@ -1184,13 +1290,14 @@ describe("torus-protocol lifecycle", () => {
     const m2 = await failure(issueTokenTx(withDelegate));
     assert.match(m2 ?? "", /DisallowedMintExtension/, "rejected with a disallowed extension");
 
-    // Registering someone else's mint (the signer is not the mint authority).
+    // Registering someone else's mint (the signing partner is registered, but is not the mint authority).
     const legit = await createTorusMint();
     const squatter = Keypair.generate();
     await airdrop(squatter.publicKey);
-    const m3 = await failure(issueTokenTx(legit, squatter));
-    assert.match(m3 ?? "", /MintAuthorityNotIssuer/, "rejected unless the signer is the mint authority");
-    assert.isNull(await failure(issueTokenTx(legit)), "control: the real issuer can register");
+    await registerLocalPartnerTx(squatter.publicKey, 0);
+    const m3 = await failure(issueTokenTx(legit, issuer, FEE_BPS, MAX_FEE, squatter));
+    assert.match(m3 ?? "", /MintAuthorityNotIssuer/, "rejected unless the signing partner is the mint authority");
+    assert.isNull(await failure(issueTokenTx(legit)), "control: the partner that issued it can register");
 
     // Fee schedule swap: only the newer config matches the declared rate while the older (current) one differs, then the authority is revoked.
     const swapped = await createTorusMint({ feeConfigAuthority: authority.publicKey });
@@ -1295,11 +1402,11 @@ describe("torus-protocol lifecycle", () => {
     const outsider = Keypair.generate();
     await airdrop(outsider.publicKey, 1);
     const byOutsider = await failure(designateTx(mint, periodId, outsider));
-    assert.match(byOutsider ?? "", /Unauthorized/, "only the operator can supply entropy");
+    assert.match(byOutsider ?? "", /Unauthorized/, "within the grace only the operator fixes the sample, with its committed seed");
 
     await designateTx(mint, periodId);
     const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
-    assert.equal(audit.sampleIndices.length, 6, "the sample size is the manifest's (the caller cannot choose)");
+    assert.equal(audit.sampleSize, 6, "the sample size is the manifest's (the caller cannot choose)");
   });
 
   it("(q) self-transfers and the fee cap do not trip the cross-check", async () => {
@@ -1373,15 +1480,11 @@ describe("torus-protocol lifecycle", () => {
       .rpc();
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
-    const index = (await sampledIndices(mint, periodId))[0];
+    const index = (await sampledIndices(mint, periodId, big))[0];
 
-    // A proof from the 16-leaf tree (4 siblings) does not fit the shape for 8 leaves (3), so it fails.
-    const shape = await failure(
-      program.methods
-        .verifyDisclosure(big.outcomeAt(index), big.beneficiaryAt(index), new BN(big.valueAt(index).toString()), big.proof(index))
-        .accounts({ crank: authority.publicKey, audit: client.pdas.audit(mint, periodId)[0] })
-        .rpc(),
-    );
+    // A proof from the 16-leaf tree (4 siblings) does not fit the shape for 8 leaves (3), and a leaf past the declared
+    // population has no place in it, so whichever leaf the sample landed on, it fails.
+    const shape = await failure(discloseTx(mint, periodId, big, index));
     assert.isNotNull(shape, "a proof from a tree with leaves outside the population must be rejected");
     assert.match(shape!, /ProofShapeMismatch/, "the proof shape does not match index and population");
   });
@@ -1412,7 +1515,7 @@ describe("torus-protocol lifecycle", () => {
   async function setupFeeFunded(): Promise<PublicKey> {
     const mint = await createTorusMint();
     await issueTokenTx(mint);
-    await setManifestTx(mint, TERM_LEN);
+    await setManifestTx(mint, TERM_LEN, FEE_FUNDED);
     await setTermsTx(mint);
     const { dst } = await accrueVolume(mint, VOLUME);
     await harvest(mint, [dst]);
@@ -1458,9 +1561,9 @@ describe("torus-protocol lifecycle", () => {
     await verifyUniqueness(mint, periodId, tree);
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
-    const indices = await sampledIndices(mint, periodId);
+    const indices = await sampledIndices(mint, periodId, tree);
     await submitDisclosures(mint, periodId, tree, indices);
-    await observe(mint, periodId, auditor, scenario === "attackX" ? (a) => a / 10n : (a) => a);
+    await observe(mint, periodId, undefined, scenario === "attackX" ? (a) => a / 10n : (a) => a);
     await finalizeTx(mint, periodId);
     return tree;
   }
@@ -1583,7 +1686,8 @@ describe("torus-protocol lifecycle", () => {
     assert.equal((after.issuerPending as BN).toNumber() + (after.issuerClaimable as BN).toNumber(), 0, "nothing left to claim");
   });
 
-  function replaceAuditorTx(mint: PublicKey, periodId: BN, currentAuditor: PublicKey, newAuditor: PublicKey, signer: Keypair = authority) {
+  /** The operator replaces the cycle's auditor; the program draws the new one. */
+  function replaceAuditorTx(mint: PublicKey, periodId: BN, currentAuditor: PublicKey, signer: Keypair = authority) {
     return program.methods
       .replaceAuditor()
       .accounts({
@@ -1593,41 +1697,125 @@ describe("torus-protocol lifecycle", () => {
         manifest: client.pdas.manifest(mint)[0],
         audit: client.pdas.audit(mint, periodId)[0],
         currentAuditorRecord: client.pdas.auditorRecord(currentAuditor)[0],
-        newAuditor,
-        newAuditorRecord: client.pdas.auditorRecord(newAuditor)[0],
+        auditorRegistry: client.pdas.auditorRegistry()[0],
       })
       .signers(signer === authority ? [] : [signer])
       .rpc();
   }
 
-  it("(w) if the auditor does not record by the deadline, the operator replaces it and the audit continues", async () => {
+  it("(w) if the auditor does not record by the deadline, the operator replaces it with a drawn auditor and the audit continues", async () => {
     // Make the period (= audit deadline) longer than the disclosures take, to test the rejection before the deadline.
     const mint = await setupToken({ periodLen: 12 });
     const c = await commitAndSample(mint, (b) => b);
     await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
-    const replace = (signer: Keypair, newAuditor: PublicKey) =>
-      replaceAuditorTx(mint, c.periodId, auditor.publicKey, newAuditor, signer);
+    const drawn = await cycleAuditor(mint, c.periodId);
+    const replace = (signer: Keypair) => replaceAuditorTx(mint, c.periodId, drawn.publicKey, signer);
 
     // No replacement before the deadline (still no swap to a colluding key mid-cycle)
-    assert.match((await failure(replace(authority, auditor2.publicKey))) ?? "", /AuditorReplacementNotDue/, "no replacement before the deadline");
+    assert.match((await failure(replace(authority))) ?? "", /AuditorReplacementNotDue/, "no replacement before the deadline");
 
     const ts: any = await tokenState(mint);
     await waitChainTime((ts.auditDeadline as BN).toNumber());
     const outsider = Keypair.generate();
     await airdrop(outsider.publicKey, 1);
-    assert.match((await failure(replace(outsider, auditor2.publicKey))) ?? "", /Unauthorized/, "only the operator can replace");
-    assert.match((await failure(replace(authority, Keypair.generate().publicKey))) ?? "", /AccountNotInitialized/, "cannot replace with an unregistered auditor");
-    assert.match((await failure(replace(authority, auditor.publicKey))) ?? "", /InvalidReplacementAuditor/, "cannot replace with the current auditor");
+    assert.match((await failure(replace(outsider))) ?? "", /Unauthorized/, "only the operator can replace");
 
-    await replace(authority, auditor2.publicKey);
+    await replace(authority);
+    const replacement = await cycleAuditor(mint, c.periodId);
+    assert.notEqual(replacement.publicKey.toBase58(), drawn.publicKey.toBase58(), "the replacement is drawn among the other auditors");
     const tsAfter: any = await tokenState(mint);
     assert.isAbove((tsAfter.auditDeadline as BN).toNumber(), (ts.auditDeadline as BN).toNumber(), "the new auditor gets one more period");
 
-    assert.match((await failure(observe(mint, c.periodId, auditor))) ?? "", /UnauthorizedAuditor/, "the old auditor can no longer record");
-    await observe(mint, c.periodId, auditor2);
+    assert.match((await failure(observe(mint, c.periodId, drawn))) ?? "", /UnauthorizedAuditor/, "the old auditor can no longer record");
+    await observe(mint, c.periodId, undefined);
     await finalizeTx(mint, c.periodId);
     const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, c.periodId)[0]);
     assert.equal(audit.result, 1, "the audit finalizes with the new auditor's record (Pass)");
+  });
+
+  it("(bs) a period provisioned after its window because someone else held up the previous cycle is excused: not judged, still owed", async () => {
+    // P1: the issuer commits and reports on time, but its drawn auditor never records.
+    const mint = await setupToken({ periodLen: 12 });
+    const c = await commitAndSample(mint, (b) => b);
+    const { dst } = await accrueVolume(mint, VOLUME); // volume in P1's window: P2 gets an obligation
+    await harvest(mint, [dst]);
+    await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
+    const drawn = await cycleAuditor(mint, c.periodId);
+    await waitChainTime(((await tokenState(mint)).auditDeadline as BN).toNumber());
+    await replaceAuditorTx(mint, c.periodId, drawn.publicKey);
+    await observe(mint, c.periodId, undefined);
+    await finalizeTx(mint, c.periodId);
+    const p1: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, c.periodId)[0]);
+    assert.equal(p1.result, 1, "P1 passes with the replacement's record");
+    assert.isTrue(p1.heldUp, "the replaced auditor held P1 up");
+    assert.isTrue(p1.issuerOnTime, "the issuer committed and reported on time");
+
+    // P2 can only be provisioned now, after its window: none of its obligation is judged.
+    await depositTx(mint, OBLIGATION);
+    await provision(mint);
+    const ts2: any = await tokenState(mint);
+    const p2Id = ts2.periodId as BN;
+    const budget = (ts2.budget as BN).toNumber();
+    assert.isAbove(budget, 0, "P2 has an obligation");
+    assert.equal((ts2.judgedBudget as BN).toNumber(), 0, "none of it is judged");
+
+    // The issuer commits what it delivered anyway (a tenth); the cycle runs as usual and comes out excused.
+    const delivered = Math.floor(budget / 10);
+    const tree = buildTree(delivered);
+    await commitTx(mint, p2Id, tree, delivered);
+    await verifyUniqueness(mint, p2Id, tree);
+    await waitAfterCommit(mint, p2Id);
+    await designateTx(mint, p2Id);
+    await submitDisclosures(mint, p2Id, tree, await sampledIndices(mint, p2Id, tree));
+    await observe(mint, p2Id, undefined);
+    const before: any = await tokenState(mint);
+    await finalizeTx(mint, p2Id);
+    const p2: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, p2Id)[0]);
+    const after: any = await tokenState(mint);
+    assert.equal(p2.result, 7, "AuditResult::Excused");
+    assert.equal(after.tier, before.tier, "no tier lost");
+    assert.equal(after.consecutivePasses, before.consecutivePasses, "the streak stays");
+    assert.equal((after.excusedCarry as BN).toNumber(), budget - delivered, "the rest is still owed, carried");
+    assert.equal((after.unfulfilled as BN).toString(), (before.unfulfilled as BN).toString(), "and not judged again");
+
+    // The next budget carries it (escrowed, deliverable) but never judges it.
+    await depositTx(mint, OBLIGATION);
+    await waitPeriod(mint);
+    await provision(mint);
+    const ts3: any = await tokenState(mint);
+    assert.equal((ts3.excusedCarry as BN).toNumber(), 0, "the carry moved into the budget");
+    assert.isAtLeast((ts3.budget as BN).toNumber(), budget - delivered, "the budget holds the carry");
+    assert.isAtMost((ts3.judgedBudget as BN).toNumber(), (ts3.budget as BN).toNumber() - (budget - delivered), "the carry is not judged");
+  });
+
+  it("(bt) the cycle's auditor can excuse a share of the obligation for a cause the chain cannot see, with its reasons", async () => {
+    const mint = await setupToken();
+    // Half delivered: beyond the shortfall band, so under-delivered if judged on all of it.
+    const c = await commitAndSample(mint, (b) => Math.floor(b / 2));
+    await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
+    const auditor = await cycleAuditor(mint, c.periodId);
+    const excuse = (signer: Keypair, bps: number, reasons: number[]) =>
+      program.methods
+        .excuseShortfall(bps, reasons)
+        .accounts({ auditor: signer.publicKey, audit: client.pdas.audit(mint, c.periodId)[0], auditorRecord: client.pdas.auditorRecord(auditor.publicKey)[0] })
+        .signers([signer])
+        .rpc();
+    const reasons = Array(32).fill(7);
+    const outsider = Keypair.generate();
+    assert.match((await failure(excuse(outsider, 5_000, reasons))) ?? "", /UnauthorizedAuditor/, "only the cycle's auditor excuses");
+    assert.match((await failure(excuse(auditor, 10_001, reasons))) ?? "", /InvalidExcuse/, "at most 100%");
+    assert.match((await failure(excuse(auditor, 5_000, Array(32).fill(0)))) ?? "", /InvalidExcuse/, "an excuse comes with its reasons");
+
+    await excuse(auditor, 5_000, reasons);
+    await observe(mint, c.periodId, undefined);
+    await finalizeTx(mint, c.periodId);
+    const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, c.periodId)[0]);
+    const ts: any = await tokenState(mint);
+    assert.equal(audit.auditorExcusedBps, 5_000);
+    assert.equal(audit.result, 1, "judged on the half not excused, the delivered half passes");
+    assert.equal((ts.unfulfilled as BN).toNumber(), 0, "nothing judged is missing");
+    assert.equal((ts.excusedCarry as BN).toNumber(), c.budget - c.controlTotal, "the excused half is still owed, carried");
+    assert.match((await failure(excuse(auditor, 0, reasons))) ?? "", /InvalidAuditStage/, "no excuse after finalization");
   });
 
   it("(x) payouts of promises beyond the obligation do not touch funds reserved for the next period", async () => {
@@ -1638,7 +1826,7 @@ describe("torus-protocol lifecycle", () => {
     // Period 1: promise 1_600_000 against an obligation of 1_000_000 and pass (only the obligation is reserved)
     const c = await commitAndSample(mint, (b) => b + 600_000);
     await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
-    await observe(mint, c.periodId, auditor);
+    await observe(mint, c.periodId, undefined);
     await finalizeTx(mint, c.periodId);
     const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, c.periodId)[0]);
     assert.equal(audit.result, 1, "Pass");
@@ -1758,8 +1946,8 @@ describe("torus-protocol lifecycle", () => {
     await verifyUniqueness(mint, p.periodId, tree);
     await waitAfterCommit(mint, p.periodId);
     await designateTx(mint, p.periodId);
-    await submitDisclosures(mint, p.periodId, tree, await sampledIndices(mint, p.periodId));
-    await observe(mint, p.periodId, auditor);
+    await submitDisclosures(mint, p.periodId, tree, await sampledIndices(mint, p.periodId, tree));
+    await observe(mint, p.periodId, undefined);
     await finalizeTx(mint, p.periodId);
     // No provisioning after the requested period
     while (((await tokenState(mint)).periodId as BN).toNumber() <= r) {
@@ -1826,7 +2014,7 @@ describe("torus-protocol lifecycle", () => {
       const c = await commitAndSample(mint, (b) => b, BIG_POP);
       await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
       // Only the first sample is observed at half its claim (the residual stays within 5% of the total; one defect).
-      await observe(mint, c.periodId, auditor, (a, j) => (j === 0 ? a / 2n : a));
+      await observe(mint, c.periodId, undefined, (a, j) => (j === 0 ? a / 2n : a));
       await finalizeTx(mint, c.periodId);
       return (await program.account.auditCycle.fetch(client.pdas.audit(mint, c.periodId)[0])) as any;
     }
@@ -1897,8 +2085,8 @@ describe("torus-protocol lifecycle", () => {
     // --- Without the uniqueness proof the cycle cannot finalize, and after the deadline it is the issuer's default ---
     await waitAfterCommit(m1, p1.periodId);
     await designateTx(m1, p1.periodId);
-    await submitDisclosures(m1, p1.periodId, dupTree, await sampledIndices(m1, p1.periodId));
-    await observe(m1, p1.periodId, auditor);
+    await submitDisclosures(m1, p1.periodId, dupTree, await sampledIndices(m1, p1.periodId, dupTree));
+    await observe(m1, p1.periodId, undefined);
     assert.match((await failure(finalizeTx(m1, p1.periodId))) ?? "", /UniquenessNotVerified/, "no finalization before uniqueness is verified");
     const tsD: any = await tokenState(m1);
     await waitChainTime((tsD.auditDeadline as BN).toNumber());
@@ -1921,8 +2109,8 @@ describe("torus-protocol lifecycle", () => {
     assert.equal(((await program.account.auditCycle.fetch(client.pdas.audit(m2, p2.periodId)[0])) as any).uniquenessVerified, true, "restarting with the right leaves verifies");
     await waitAfterCommit(m2, p2.periodId);
     await designateTx(m2, p2.periodId);
-    await submitDisclosures(m2, p2.periodId, real, await sampledIndices(m2, p2.periodId));
-    await observe(m2, p2.periodId, auditor);
+    await submitDisclosures(m2, p2.periodId, real, await sampledIndices(m2, p2.periodId, real));
+    await observe(m2, p2.periodId, undefined);
     await finalizeTx(m2, p2.periodId);
 
     // --- Reusing a recognized payment ID in a later period of the same token ---
@@ -1990,77 +2178,25 @@ describe("torus-protocol lifecycle", () => {
     await startLiquidationTx(frozenMint!);
     assert.equal((await balance(slashDestAta)) - slashBefore, frozenPool, "without finalized rights, the surplus goes to the compensation pool");
   });
-  it("(af) auditor revocation: no recording, no confirmation, no new cycle from a stale manifest; replaced without waiting", async () => {
-    // Register auditors not shared with other tests, since they get revoked.
-    const a3 = Keypair.generate();
-    const a4 = Keypair.generate();
-    for (const a of [a3, a4]) {
-      await program.methods
-        .registerAuditor()
-        .accounts({
-          authority: authority.publicKey,
-          config: client.pdas.config()[0],
-          auditor: a.publicKey,
-          auditorRecord: client.pdas.auditorRecord(a.publicKey)[0],
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-      await airdrop(a.publicKey, 2);
-    }
-    const revokeTx = (signer: Keypair, a: PublicKey) =>
-      program.methods
-        .revokeAuditor()
-        .accounts({ authority: signer.publicKey, config: client.pdas.config()[0], auditorRecord: client.pdas.auditorRecord(a)[0] })
-        .signers(signer === authority ? [] : [signer])
-        .rpc();
-
-    // Make the period (= audit deadline) longer than recording takes, to test replacement before the deadline.
-    const mint = await setupToken({ auditor: a3.publicKey, periodLen: 40 });
-    const c = await commitAndSample(mint, (b) => b);
-    await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
-    await observe(mint, c.periodId, a3);
-    const auditPda = client.pdas.audit(mint, c.periodId)[0];
-    let audit: any = await program.account.auditCycle.fetch(auditPda);
-    assert.equal(audit.stage, 2, "all observed: Verified");
-
-    // Only the operator can revoke, and only once.
-    const outsider = Keypair.generate();
-    await airdrop(outsider.publicKey, 1);
-    assert.match((await failure(revokeTx(outsider, a3.publicKey))) ?? "", /Unauthorized/, "only the operator can revoke");
-    await revokeTx(authority, a3.publicKey);
-    assert.match((await failure(revokeTx(authority, a3.publicKey))) ?? "", /AuditorRevoked/, "revocation happens once");
-
-    // A revoked auditor cannot confirm leaves.
-    const unsampled = [...Array(POP).keys()].find((i) => !c.sampleIndices.includes(i))!;
-    assert.match((await failure(attestTx(mint, c.periodId, c.tree, unsampled, undefined, a3))) ?? "", /AuditorRevoked/, "a revoked auditor cannot confirm");
-
-    // Even before the deadline the operator can replace a revoked auditor; before finalization the sample is observed again (Verified → Sampled).
-    const ts: any = await tokenState(mint);
-    assert.isBelow(await chainTime(), (ts.auditDeadline as BN).toNumber(), "still before the deadline");
-    await replaceAuditorTx(mint, c.periodId, a3.publicKey, a4.publicKey);
-    audit = await program.account.auditCycle.fetch(auditPda);
-    assert.equal(audit.stage, 1, "back to Sampled to observe again");
-    assert.equal(audit.sampleObserved.length, 0, "the revoked auditor's observations are discarded");
-    assert.equal(audit.auditor.toBase58(), a4.publicKey.toBase58(), "the new auditor");
-    assert.match((await failure(finalizeTx(mint, c.periodId))) ?? "", /InvalidAuditStage/, "no finalization until observed again");
-    assert.match((await failure(observe(mint, c.periodId, a3))) ?? "", /UnauthorizedAuditor|AuditorRevoked/, "a revoked auditor cannot record");
-
-    await observe(mint, c.periodId, a4);
-    await finalizeTx(mint, c.periodId);
-    audit = await program.account.auditCycle.fetch(auditPda);
-    assert.equal(audit.result, 1, "finalized with the new auditor's observations (Pass)");
-
-    // After finalization, the new auditor confirms leaves.
-    await attestTx(mint, c.periodId, c.tree, unsampled, undefined, a4);
-
-    // A manifest still naming the revoked auditor cannot start the next cycle.
-    await depositTx(mint, OBLIGATION); // enough to reserve period 2's obligation on top of period 1's unpaid amount
-    const next = await accrueAndProvision(mint);
-    const tree2 = buildTree(next.budget);
-    assert.match((await failure(commitTx(mint, next.periodId, tree2, next.budget))) ?? "", /AuditorRevoked/, "no new cycle from a stale manifest");
-    // Re-fixing the manifest with an active auditor resumes (control).
-    await setManifestTx(mint, TERM_LEN, { auditor: a4.publicKey });
-    await commitTx(mint, next.periodId, tree2, next.budget);
+  it("(bq) the cycle's auditor is drawn from the registry when the sample is fixed; an auditor listed after the commit is never drawn", async () => {
+    const mint = await setupToken();
+    const { periodId, budget } = await accrueAndProvision(mint);
+    const tree = buildTree(budget);
+    await commitTx(mint, periodId, tree, budget);
+    await verifyUniqueness(mint, periodId, tree);
+    // Listed after the commit: by then the operator may already know the cycle's randomness, so it must not count.
+    const late = Keypair.generate();
+    await registerAuditorTx(late);
+    await waitAfterCommit(mint, periodId);
+    await designateTx(mint, periodId);
+    const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
+    const drawn = (audit.auditor as PublicKey).toBase58();
+    assert.notEqual(drawn, late.publicKey.toBase58(), "an auditor listed after the commit does not count");
+    assert.notEqual(drawn, issuer.publicKey.toBase58(), "never the issuer");
+    assert.isTrue(auditorKeys.has(drawn), "one of the registered auditors");
+    const registry: any = await program.account.auditorRegistry.fetch(client.pdas.auditorRegistry()[0]);
+    const entry = registry.entries.find((e: any) => e.auditor.toBase58() === late.publicKey.toBase58());
+    assert.isAbove(entry.addedSlot.toNumber(), (audit.committedSlot as BN).toNumber(), "listed after the commit slot");
   });
 
   // ---------------------------------------------------------------- end of a manifest and the next one
@@ -2125,8 +2261,8 @@ describe("torus-protocol lifecycle", () => {
     await verifyUniqueness(mint, periodId, tree);
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
-    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId));
-    await observe(mint, periodId, auditor);
+    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId, tree));
+    await observe(mint, periodId, undefined);
     await finalizeTx(mint, periodId);
 
     const audit: any = await program.account.auditCycle.fetch(client.pdas.audit(mint, periodId)[0]);
@@ -2339,7 +2475,7 @@ describe("torus-protocol lifecycle", () => {
   async function setupEscrowToken(m: ManifestOpts & { termLen?: BN } = {}) {
     const iss = Keypair.generate();
     await airdrop(iss.publicKey, 5);
-    const mint = await setupToken({ ...m, issuer: iss });
+    const mint = await setupToken({ ...FEE_FUNDED, ...m, issuer: iss });
     const p = Keypair.generate();
     await registerPartnerTx(p.publicKey);
     await setEscrowPartnerTx(mint, iss, p.publicKey);
@@ -2403,9 +2539,12 @@ describe("torus-protocol lifecycle", () => {
         config: client.pdas.config()[0],
         auditor: p1.publicKey,
         auditorRecord: client.pdas.auditorRecord(p1.publicKey)[0],
+        auditorRegistry: client.pdas.auditorRegistry()[0],
         systemProgram: SystemProgram.programId,
       })
       .rpc();
+    auditorKeys.set(p1.publicKey.toBase58(), p1);
+    await airdrop(p1.publicKey, 2); // drawn as an auditor later, it pays the fees of its leaf confirmations
     assert.match(
       (await failure(setManifestTx(mint, TERM_LEN, { issuer: iss, auditor: p1.publicKey }))) ?? "",
       /RolesNotSeparate/,
@@ -2605,7 +2744,9 @@ describe("torus-protocol lifecycle", () => {
   });
 
   it("(ar) the company can request a payment from the bond: down to half its target, with both approvals, straight to the payee; redemptions go on and fees refill it", async () => {
-    const { iss, mint, p } = await setupEscrowToken();
+    // This token's first obligation is provisioned before any fee is converted, so its volume is valued at the
+    // minimum price (one USDC per token): it keeps the 50% return of the deposit-funded tests.
+    const { iss, mint, p } = await setupEscrowToken({ returnRateBps: RETURN_RATE_BPS, floorBps: FLOOR_BPS });
     const bondPda = client.pdas.slashingBond(mint)[0];
     const vendorUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, Keypair.generate().publicKey);
     const issuerUsdc = await createAssociatedTokenAccount(connection, authority, usdcMint, iss.publicKey);
@@ -2644,7 +2785,7 @@ describe("torus-protocol lifecycle", () => {
     // Before the bond first reaches its target, it cannot be drawn on
     const iss2 = Keypair.generate();
     await airdrop(iss2.publicKey, 5);
-    const fresh = await createTorusMint({ mintAuthority: iss2 });
+    const fresh = await createTorusMint();
     await issueTokenTx(fresh, iss2);
     await setManifestTx(fresh, TERM_LEN, { issuer: iss2 });
     await setTermsTx(fresh);
@@ -2657,7 +2798,7 @@ describe("torus-protocol lifecycle", () => {
   async function toVerified(mint: PublicKey, controlTotalOf: (budget: number) => number = (b) => b) {
     const c = await commitAndSample(mint, controlTotalOf);
     await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
-    await observe(mint, c.periodId, auditor);
+    await observe(mint, c.periodId, undefined);
     return c;
   }
 
@@ -2885,7 +3026,7 @@ describe("torus-protocol lifecycle", () => {
     const mint = await createTorusMint();
     await issueTokenTx(mint);
     await setManifestTx(mint, TERM_LEN);
-    const terms = (tiers: number[], lp?: PublicKey) => setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, tiers, lp);
+    const terms = (tiers: number[], lp?: Keypair) => setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, tiers, lp);
     assert.match((await failure(terms([3_000, 2_000, 5_000, 6_500]))) ?? "", /InvalidTierShares/, "a higher rank never gets less");
     assert.match((await failure(terms([2_000, 3_500, 5_000, 10_001]))) ?? "", /InvalidTierShares/, "at most 100%");
 
@@ -2895,7 +3036,7 @@ describe("torus-protocol lifecycle", () => {
     assert.match((await failure(registerLocalPartnerTx(lp2.publicKey, 10_001))) ?? "", /InvalidShareBps/, "at most 100%");
     assert.match((await failure(registerLocalPartnerTx(lp2.publicKey, 3_000, outsider))) ?? "", /Unauthorized/, "only the operator");
     await registerLocalPartnerTx(lp2.publicKey, 3_000);
-    await terms([1_000, 2_000, 3_000, 4_000], lp2.publicKey);
+    await terms([1_000, 2_000, 3_000, 4_000], lp2);
     const ts = await tokenState(mint);
     assert.equal(ts.distributionRatioBps, 1_000, "rank 0 share of this company");
     assert.ok(ts.localPartner.equals(lp2.publicKey));
@@ -2917,7 +3058,7 @@ describe("torus-protocol lifecycle", () => {
       .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], localPartnerRecord: client.pdas.localPartner(lp2.publicKey)[0] })
       .rpc();
     assert.deepEqual(await split(), [90_000, 0]);
-    assert.match((await failure(terms(TIER_SHARES, lp2.publicKey))) ?? "", /LocalPartnerNotRegistered/);
+    assert.match((await failure(terms(TIER_SHARES, lp2))) ?? "", /LocalPartnerNotRegistered/);
   });
 
   it("(ax) the mint authority moves to the program; only a restamp mints, signed by the holder and the local partner, never more than it burns", async () => {
@@ -3004,7 +3145,7 @@ describe("torus-protocol lifecycle", () => {
     taxBook.set(a.toBase58(), null);
     const ca = await commitAndSample(a, (b) => b);
     await submitDisclosures(a, ca.periodId, ca.tree, ca.sampleIndices);
-    await observe(a, ca.periodId, auditor, (x) => x / 10n);
+    await observe(a, ca.periodId, undefined, (x) => x / 10n);
     assert.isBelow(await chainTime(), (await tokenState(a)).auditDeadline.toNumber(), "the report is not due yet");
     await finalizeTx(a, ca.periodId);
     assert.equal((await auditOf(a, ca.periodId)).result, 2, "FraudOverstatement without waiting for the report");
@@ -3016,7 +3157,7 @@ describe("torus-protocol lifecycle", () => {
     taxBook.set(b.toBase58(), OBLIGATION / 2);
     const cb = await commitAndSample(b, (x) => x);
     await submitDisclosures(b, cb.periodId, cb.tree, cb.sampleIndices);
-    await observe(b, cb.periodId, auditor, (x) => x / 10n);
+    await observe(b, cb.periodId, undefined, (x) => x / 10n);
     await finalizeTx(b, cb.periodId);
     const audit = await auditOf(b, cb.periodId);
     assert.equal(audit.result, 2, "FraudOverstatement, not held");
@@ -3053,7 +3194,7 @@ describe("torus-protocol lifecycle", () => {
     const lp = Keypair.generate();
     await airdrop(lp.publicKey, 1);
     await registerLocalPartnerTx(lp.publicKey, 3_000);
-    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, TIER_SHARES, lp.publicKey);
+    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, TIER_SHARES, lp);
     const { dst } = await accrueVolume(mint, VOLUME);
     await harvest(mint, [dst]);
 
@@ -3087,8 +3228,8 @@ describe("torus-protocol lifecycle", () => {
     await verifyUniqueness(mint, p.periodId, tree);
     await waitAfterCommit(mint, p.periodId);
     await designateTx(mint, p.periodId);
-    await submitDisclosures(mint, p.periodId, tree, await sampledIndices(mint, p.periodId));
-    await observe(mint, p.periodId, auditor);
+    await submitDisclosures(mint, p.periodId, tree, await sampledIndices(mint, p.periodId, tree));
+    await observe(mint, p.periodId, undefined);
     await finalizeTx(mint, p.periodId);
     await finalizeExitTx(mint);
     assert.isTrue((await tokenState(mint)).exited);
@@ -3101,7 +3242,7 @@ describe("torus-protocol lifecycle", () => {
     const mint = await setupToken();
     const c = await commitAndSample(mint, (b) => b, POP, false); // the issuer withholds the uniqueness proof
     await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
-    await observe(mint, c.periodId, auditor, (x) => x / 10n);
+    await observe(mint, c.periodId, undefined, (x) => x / 10n);
     await finalizeTx(mint, c.periodId);
     assert.equal((await auditOf(mint, c.periodId)).result, 2, "FraudOverstatement without waiting for the deadline");
     assert.isTrue((await tokenState(mint)).frozen);
@@ -3234,8 +3375,8 @@ describe("torus-protocol lifecycle", () => {
     await verifyUniqueness(mint, periodId, tree);
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
-    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId));
-    await observe(mint, periodId, auditor);
+    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId, tree));
+    await observe(mint, periodId, undefined);
     await finalizeTx(mint, periodId);
     assert.equal((await auditOf(mint, periodId)).result, 1, "Pass");
 
@@ -3280,8 +3421,8 @@ describe("torus-protocol lifecycle", () => {
     await verifyUniqueness(mint, periodId, tree);
     await waitAfterCommit(mint, periodId);
     await designateTx(mint, periodId);
-    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId));
-    await observe(mint, periodId, auditor, (x) => x / 10n);
+    await submitDisclosures(mint, periodId, tree, await sampledIndices(mint, periodId, tree));
+    await observe(mint, periodId, undefined, (x) => x / 10n);
     await finalizeTx(mint, periodId);
     assert.isTrue((await tokenState(mint)).frozen);
 
@@ -3296,7 +3437,7 @@ describe("torus-protocol lifecycle", () => {
     const lp = Keypair.generate();
     await airdrop(lp.publicKey, 1);
     await registerLocalPartnerTx(lp.publicKey, 5_000);
-    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, [5_000, 6_000, 7_000, 8_000], lp.publicKey);
+    await setTermsTx(mint, authority, BOND_TARGET, MIN_PRICE, [5_000, 6_000, 7_000, 8_000], lp);
     const { seller, sellerAta, periodId, lot } = await setupSeller(mint, VOLUME, 100_000);
     const period: any = await program.account.perkPeriod.fetch(client.pdas.perkPeriod(mint, periodId)[0]);
     assert.equal(period.listableRateBps, 20, "10 kept + 10 return");
@@ -3309,7 +3450,7 @@ describe("torus-protocol lifecycle", () => {
     const revoked = Keypair.generate();
     await airdrop(revoked.publicKey, 1);
     await registerLocalPartnerTx(revoked.publicKey, 5_000);
-    await setTermsTx(other, authority, BOND_TARGET, MIN_PRICE, [5_000, 6_000, 7_000, 8_000], revoked.publicKey);
+    await setTermsTx(other, authority, BOND_TARGET, MIN_PRICE, [5_000, 6_000, 7_000, 8_000], revoked);
     await program.methods
       .revokeLocalPartner()
       .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], localPartnerRecord: client.pdas.localPartner(revoked.publicKey)[0] })
@@ -3341,5 +3482,295 @@ describe("torus-protocol lifecycle", () => {
     const lot: any = await program.account.perkLot.fetch(client.pdas.perkLot(mint, periodId, account)[0]);
     assert.equal(lot.seller.toBase58(), seller.publicKey.toBase58());
     assert.equal(lot.listed.toNumber(), 100);
+  });
+
+  it("(bl) a fabricated entry holding most of the total is sampled in proportion to its value", async () => {
+    const mint = await setupToken({ sampleSize: 8 });
+    const { periodId, budget } = await accrueAndProvision(mint);
+    // Only a tenth of the obligation was delivered (seven small genuine entries); one fabricated entry carries the rest.
+    const genuine = distributeLeafValues(Math.floor(budget / 10), POP - 1);
+    const fabricated = BigInt(budget) - genuine.reduce((a, b) => a + b, 0n);
+    const entries = [...genuine, fabricated].map((value) => ({ outcomeId: newOutcome(), beneficiary: Keypair.generate().publicKey, value }));
+    const tree = new SumTree(sortByOutcome(entries));
+    const fake = tree.values.findIndex((v) => v === fabricated);
+    await commitTx(mint, periodId, tree, budget);
+    await verifyUniqueness(mint, periodId, tree);
+    await waitAfterCommit(mint, periodId);
+
+    // Nobody supplies the entropy any more (it used to be an argument: whoever passed it could pick a sample that
+    // missed the fabricated entry). The slot hash is captured and the operator reveals the seed it committed to.
+    await designateTx(mint, periodId);
+    const sampled = await sampledIndices(mint, periodId, tree);
+    assert.include(sampled, fake, "a sample lands on the entry that holds nine tenths of the total");
+
+    // A sample cannot be answered with an entry it did not land on.
+    const other = sampled[0] === fake ? (fake + 1) % POP : fake;
+    assert.match((await failure(discloseTx(mint, periodId, tree, other))) ?? "", /SampleNotCovered/, "the disclosed leaf must cover the sampled position");
+    await submitDisclosures(mint, periodId, tree, sampled);
+
+    // The auditor reports what it finds: nothing behind the fabricated entry, the claim behind the genuine ones.
+    await observe(mint, periodId, undefined, (a) => (a === fabricated ? 0n : a));
+    await finalizeTx(mint, periodId);
+    const audit: any = await auditOf(mint, periodId);
+    assert.equal(audit.result, 2, "the fabricated entry is found: FraudOverstatement");
+    assert.equal((await tokenState(mint)).frozen, true, "frozen");
+  });
+
+  it("(bm) nobody picks the sample alone: the slot hash comes after the commitment, only the operator's committed seed fixes the sample within the grace, and afterwards anyone continues with a doubled sample", async () => {
+    // --- No period closes before the operator has posted its seed commitment ---
+    const unseeded = await createTorusMint();
+    await issueTokenTx(unseeded);
+    await setManifestTx(unseeded, TERM_LEN);
+    await program.methods
+      .setIssuerTerms(BOND_TARGET, MIN_PRICE, TIER_SHARES, PARTNER_TERMS)
+      .accounts({
+        authority: authority.publicKey,
+        config: client.pdas.config()[0],
+        tokenState: client.pdas.tokenState(unseeded)[0],
+        localPartner: localPartner.publicKey,
+        localPartnerRecord: client.pdas.localPartner(localPartner.publicKey)[0],
+      })
+      .signers([localPartner])
+      .rpc();
+    await depositTx(unseeded, DEPOSIT);
+    assert.match((await failure(provision(unseeded))) ?? "", /AuditSeedNotSet/, "no obligation before the seed commitment is posted");
+    const zeroSeed = program.methods
+      .setAuditSeed(Array(32).fill(0))
+      .accounts({ authority: authority.publicKey, config: client.pdas.config()[0], tokenState: client.pdas.tokenState(unseeded)[0] })
+      .rpc();
+    assert.match((await failure(zeroSeed)) ?? "", /InvalidSeedCommit/, "a zero commitment is rejected");
+
+    // --- The operator reveals: the sample is fixed by its committed seed and the captured slot hash ---
+    const mint = await setupToken();
+    const outsider = Keypair.generate();
+    await airdrop(outsider.publicKey, 1);
+    const first = await accrueAndProvision(mint);
+    const tree = buildTree(first.budget);
+    await commitTx(mint, first.periodId, tree, first.budget);
+    await verifyUniqueness(mint, first.periodId, tree);
+    const committed: any = await auditOf(mint, first.periodId);
+    assert.isAbove(committed.entropySlot.toNumber(), committed.committedSlot.toNumber(), "the entropy slot is after the commitment");
+    assert.deepEqual(committed.seedCommit, seedCommitment(auditSeed(mint, 0)), "the seed commitment is snapshotted at commit");
+
+    const [seed0, commit1] = [auditSeed(mint, 0), seedCommitment(auditSeed(mint, 1))];
+    assert.match((await failure(revealTx(mint, first.periodId, seed0, commit1))) ?? "", /EntropyNotCaptured/, "no sample before the slot hash is captured");
+    await waitAfterCommit(mint, first.periodId);
+    await captureTx(mint, first.periodId, outsider); // anyone can capture: the hash comes from the sysvar
+    assert.match((await failure(captureTx(mint, first.periodId))) ?? "", /EntropyAlreadyCaptured/, "captured once");
+
+    assert.match((await failure(revealTx(mint, first.periodId, auditSeed(mint, 1), commit1))) ?? "", /SeedMismatch/, "another seed is rejected");
+    assert.match((await failure(revealTx(mint, first.periodId, seed0, commit1, outsider))) ?? "", /Unauthorized/, "only the operator reveals");
+    const early = program.methods
+      .designateWithoutSeed()
+      .accounts({
+        crank: outsider.publicKey,
+        config: client.pdas.config()[0],
+        audit: client.pdas.audit(mint, first.periodId)[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        auditorRegistry: client.pdas.auditorRegistry()[0],
+      })
+      .signers([outsider])
+      .rpc();
+    assert.match((await failure(early)) ?? "", /RevealGraceNotOver/, "nobody continues without the seed during the grace");
+    assert.match((await failure(revealTx(mint, first.periodId, seed0, Array(32).fill(0)))) ?? "", /InvalidSeedCommit/, "the next commitment is required");
+    assert.match((await failure(revealTx(mint, first.periodId, seed0, seedCommitment(seed0)))) ?? "", /InvalidSeedCommit/, "a revealed seed cannot be committed again");
+
+    await designateTx(mint, first.periodId);
+    const sampled: any = await auditOf(mint, first.periodId);
+    const expected = keccak_256(Buffer.concat([Buffer.from([0x11]), Buffer.from(seed0), Buffer.from(sampled.slotHash), client.pdas.audit(mint, first.periodId)[0].toBuffer()]));
+    assert.deepEqual(sampled.entropy, Array.from(expected), "entropy = H(seed, slot hash, audit)");
+    assert.equal(sampled.sampleSize, SAMPLE, "the manifest's sample size");
+    assert.deepEqual((await tokenState(mint)).auditSeedCommit, commit1, "the commitment for the next cycle is posted with the reveal");
+    await submitDisclosures(mint, first.periodId, tree, await sampledIndices(mint, first.periodId, tree));
+    await observe(mint, first.periodId, undefined);
+    await finalizeTx(mint, first.periodId);
+    assert.equal((await auditOf(mint, first.periodId)).result, 1, "Pass");
+
+    // --- The operator stays silent: after the grace anyone continues without the seed, with a doubled sample ---
+    await depositTx(mint, OBLIGATION); // the first period's obligation stays reserved for its recipients
+    const second = await accrueAndProvision(mint);
+    const tree2 = buildTree(second.budget);
+    await commitTx(mint, second.periodId, tree2, second.budget);
+    await verifyUniqueness(mint, second.periodId, tree2);
+    await waitAfterCommit(mint, second.periodId);
+    await captureTx(mint, second.periodId);
+    const captured: any = await auditOf(mint, second.periodId);
+    await waitSlot((captured.capturedSlot as BN).toNumber() + REVEAL_GRACE);
+    await program.methods
+      .designateWithoutSeed()
+      .accounts({
+        crank: outsider.publicKey,
+        config: client.pdas.config()[0],
+        audit: client.pdas.audit(mint, second.periodId)[0],
+        tokenState: client.pdas.tokenState(mint)[0],
+        auditorRegistry: client.pdas.auditorRegistry()[0],
+      })
+      .signers([outsider])
+      .rpc();
+    const unrevealed: any = await auditOf(mint, second.periodId);
+    assert.equal(unrevealed.sampleSize, 2 * SAMPLE, "twice the sample without the seed");
+    assert.deepEqual((await tokenState(mint)).auditSeedCommit, commit1, "the unrevealed seed stays committed for the next cycle");
+    assert.match((await failure(revealTx(mint, second.periodId, auditSeed(mint, 1), seedCommitment(auditSeed(mint, 2))))) ?? "", /InvalidAuditStage/, "the sample is fixed once");
+    const indices2 = await sampledIndices(mint, second.periodId, tree2);
+    assert.equal(indices2.length, 2 * SAMPLE);
+    await submitDisclosures(mint, second.periodId, tree2, indices2);
+    await observe(mint, second.periodId, undefined);
+    await finalizeTx(mint, second.periodId);
+    assert.equal((await auditOf(mint, second.periodId)).result, 1, "an honest ledger still passes");
+  });
+
+  it("(bn) the local partner signs for the company it takes on: the operator cannot assign a company in its place", async () => {
+    const mint = await createTorusMint();
+    await issueTokenTx(mint);
+    await setManifestTx(mint, TERM_LEN);
+    const terms = (partnerKey: Keypair, hash = PARTNER_TERMS) =>
+      program.methods
+        .setIssuerTerms(BOND_TARGET, MIN_PRICE, TIER_SHARES, hash)
+        .accounts({
+          authority: authority.publicKey,
+          config: client.pdas.config()[0],
+          tokenState: client.pdas.tokenState(mint)[0],
+          localPartner: partnerKey.publicKey,
+          localPartnerRecord: client.pdas.localPartner(localPartner.publicKey)[0],
+        })
+        .signers(partnerKey === authority ? [] : [partnerKey])
+        .rpc();
+
+    // The operator signs in the partner's place, against the partner's registry record
+    assert.match((await failure(terms(authority))) ?? "", /Unauthorized/, "the registered partner itself must sign");
+    const stranger = Keypair.generate();
+    assert.match((await failure(terms(stranger))) ?? "", /Unauthorized/, "nor can any other key");
+    assert.match((await failure(terms(localPartner, Array(32).fill(0)))) ?? "", /InvalidIssuerTerms/, "the hash of the accepted terms is required");
+    assert.deepEqual((await tokenState(mint)).partnerTermsHash, Array(32).fill(0), "no terms were accepted");
+
+    await terms(localPartner);
+    const ts = await tokenState(mint);
+    assert.ok(ts.localPartner.equals(localPartner.publicKey), "the partner that signed");
+    assert.deepEqual(ts.partnerTermsHash, PARTNER_TERMS, "the terms it accepted are on record");
+  });
+
+  it("(bo) the local partner issues the token: its signature and its mint authority; the company is named as the obligor", async () => {
+    const company = Keypair.generate();
+    await airdrop(company.publicKey, 2);
+
+    // A key that is not a registered partner cannot issue, even for a mint it holds the authority of.
+    const unregistered = Keypair.generate();
+    await airdrop(unregistered.publicKey, 2);
+    const own = await createTorusMint({ mintAuthority: unregistered });
+    assert.isNotNull(await failure(issueTokenTx(own, company, FEE_BPS, MAX_FEE, unregistered)), "an unregistered key cannot issue");
+    // Nor can the company issue for itself: it is not a partner.
+    const selfIssued = await createTorusMint({ mintAuthority: company });
+    assert.isNotNull(await failure(issueTokenTx(selfIssued, company, FEE_BPS, MAX_FEE, company)), "the company cannot issue its own token");
+
+    const mint = await createTorusMint();
+    await issueTokenTx(mint, company);
+    const ts = await tokenState(mint);
+    assert.ok(ts.issuer.equals(company.publicKey), "the company is the obligor");
+    assert.ok(ts.localPartner.equals(localPartner.publicKey), "the partner that issued is on record from the start");
+    assert.equal(ts.mintDecimals, DECIMALS);
+    const m = await getMint(connection, mint, undefined, TOKEN_2022_PROGRAM_ID);
+    assert.ok(m.mintAuthority?.equals(client.pdas.poolAuthority(mint)[0]), "the program holds the mint authority afterwards");
+
+    // The promise is the company's: the partner cannot fix it in its place.
+    assert.match((await failure(setManifestTx(mint, TERM_LEN, { issuer: localPartner }))) ?? "", /Unauthorized/, "only the company fixes its promise");
+    await setManifestTx(mint, TERM_LEN, { issuer: company });
+  });
+
+  it("(bp) the obligation is counted in money: the period's volume × the return rate, valued at the rate its fees were converted at", async () => {
+    const mint = await setupToken();
+    await depositTx(mint, 4 * OBLIGATION);
+
+    // Period 1: the fee tokens sell at 2 USDC per token, so the same volume owes twice as much as at 1 USDC.
+    const first = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [first.dst]);
+    await convertTx(mint, 20_000, 40_000);
+    const p1 = await provisionUntilBudget(mint);
+    assert.equal(p1.budget, 2 * OBLIGATION, "VOLUME × return rate × 2 USDC per token");
+    const ts1 = await tokenState(mint);
+    assert.equal((ts1.rateUsdc as BN).toNumber(), 40_000, "the period's conversions become the rate of record");
+    assert.equal((ts1.rateTokens as BN).toNumber(), 20_000);
+    assert.equal((ts1.periodConvertedTokens as BN).toNumber(), 0, "the next period starts empty");
+    await auditPeriod(mint, p1.periodId, p1.budget, "pass");
+
+    // Period 2: nothing is converted, so the volume is valued at the last realized rate (not back at the minimum price).
+    const second = await accrueVolume(mint, VOLUME);
+    await harvest(mint, [second.dst]);
+    const p2 = await provisionUntilBudget(mint);
+    assert.equal(p2.budget, 2 * OBLIGATION, "the last realized rate still applies");
+  });
+
+  it("(af) auditor revocation: no recording, no confirmation, no new cycle from a stale manifest; a drawn replacement without waiting", async () => {
+    // The cycle's auditor is drawn from the whole registry, so the auditor revoked here may be one the other tests share:
+    // this test runs last.
+    const a3 = Keypair.generate();
+    const a4 = Keypair.generate();
+    for (const a of [a3, a4]) await registerAuditorTx(a);
+    assert.match((await failure(registerAuditorTx(a4))) ?? "", /AuditorAlreadyRegistered/, "an active auditor is registered once");
+    const revokeTx = (signer: Keypair, a: PublicKey) =>
+      program.methods
+        .revokeAuditor()
+        .accounts({
+          authority: signer.publicKey,
+          config: client.pdas.config()[0],
+          auditorRecord: client.pdas.auditorRecord(a)[0],
+          auditorRegistry: client.pdas.auditorRegistry()[0],
+          systemProgram: SystemProgram.programId,
+        })
+        .signers(signer === authority ? [] : [signer])
+        .rpc();
+
+    // Make the period (= audit deadline) longer than recording takes, to test replacement before the deadline.
+    const mint = await setupToken({ auditor: a3.publicKey, periodLen: 40 });
+    const c = await commitAndSample(mint, (b) => b);
+    await submitDisclosures(mint, c.periodId, c.tree, c.sampleIndices);
+    const drawn = await cycleAuditor(mint, c.periodId);
+    await observe(mint, c.periodId, undefined);
+    const auditPda = client.pdas.audit(mint, c.periodId)[0];
+    let audit: any = await program.account.auditCycle.fetch(auditPda);
+    assert.equal(audit.stage, 2, "all observed: Verified");
+
+    // Only the operator can revoke, and only once.
+    const outsider = Keypair.generate();
+    await airdrop(outsider.publicKey, 1);
+    assert.match((await failure(revokeTx(outsider, drawn.publicKey))) ?? "", /Unauthorized/, "only the operator can revoke");
+    await revokeTx(authority, drawn.publicKey);
+    assert.match((await failure(revokeTx(authority, drawn.publicKey))) ?? "", /AuditorRevoked/, "revocation happens once");
+
+    // A revoked auditor cannot confirm leaves.
+    const unsampled = [...Array(POP).keys()].find((i) => !c.sampleIndices.includes(i))!;
+    assert.match((await failure(attestTx(mint, c.periodId, c.tree, unsampled, undefined, drawn))) ?? "", /AuditorRevoked/, "a revoked auditor cannot confirm");
+
+    // Even before the deadline the operator can replace a revoked auditor; the new one is drawn, and the sample is observed again.
+    const ts: any = await tokenState(mint);
+    assert.isBelow(await chainTime(), (ts.auditDeadline as BN).toNumber(), "still before the deadline");
+    await replaceAuditorTx(mint, c.periodId, drawn.publicKey);
+    audit = await program.account.auditCycle.fetch(auditPda);
+    assert.equal(audit.stage, 1, "back to Sampled to observe again");
+    assert.equal(audit.sampleObserved.length, 0, "the revoked auditor's observations are discarded");
+    assert.notEqual(audit.auditor.toBase58(), drawn.publicKey.toBase58(), "a new auditor is drawn");
+    assert.match((await failure(finalizeTx(mint, c.periodId))) ?? "", /InvalidAuditStage/, "no finalization until observed again");
+    assert.match((await failure(observe(mint, c.periodId, drawn))) ?? "", /UnauthorizedAuditor|AuditorRevoked/, "a revoked auditor cannot record");
+
+    await observe(mint, c.periodId, undefined);
+    await finalizeTx(mint, c.periodId);
+    audit = await program.account.auditCycle.fetch(auditPda);
+    assert.equal(audit.result, 1, "finalized with the new auditor's observations (Pass)");
+
+    // After finalization, the new auditor confirms leaves.
+    await attestTx(mint, c.periodId, c.tree, unsampled);
+
+    // A revocation is permanent: a revoked auditor cannot be registered again.
+    assert.match((await failure(registerAuditorTx(drawn))) ?? "", /AuditorRevoked/, "a revoked auditor cannot come back");
+
+    // A manifest still naming a revoked auditor cannot start the next cycle.
+    if (!drawn.publicKey.equals(a3.publicKey)) await revokeTx(authority, a3.publicKey);
+    await depositTx(mint, OBLIGATION); // enough to reserve period 2's obligation on top of period 1's unpaid amount
+    const next = await accrueAndProvision(mint);
+    const tree2 = buildTree(next.budget);
+    assert.match((await failure(commitTx(mint, next.periodId, tree2, next.budget))) ?? "", /AuditorRevoked/, "no new cycle from a stale manifest");
+    // Re-fixing the manifest with an active auditor resumes (control).
+    const active = drawn.publicKey.equals(a4.publicKey) ? auditor2 : a4;
+    await setManifestTx(mint, TERM_LEN, { auditor: active.publicKey });
+    await commitTx(mint, next.periodId, tree2, next.budget);
   });
 });

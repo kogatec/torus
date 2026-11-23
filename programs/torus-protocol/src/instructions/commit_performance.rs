@@ -2,7 +2,8 @@
 //!
 //! Records the commitment to the whole ledger (Merkle-sum root commitment) and the control total (the issuer's
 //! declared total), and starts the AuditCycle. Binding the whole set before the sample is drawn rules out
-//! swapping entries afterwards (the commit slot is recorded as the reference for post-commit entropy).
+//! swapping entries afterwards. The commit also fixes where the sample's randomness will come from: the operator's
+//! seed commitment as it stands now, and a slot that does not exist yet (capture_entropy, designate_sample).
 //! Signed by the issuer. Not possible without a provisioned budget (budget == 0). After the campaign has ended, the audit
 //! of a period that started during it still runs (a period that started in the gap has no budget to commit to).
 
@@ -26,7 +27,7 @@ pub fn handler(
         ctx.accounts.token_state.budget > 0,
         TorusError::BudgetNotProvisioned
     );
-    // The population must be at least 1 so a sample can be drawn (population_size == 0 would block finalize).
+    // The ledger has at least one leaf (an empty tree has no root to commit to).
     require!(population_size > 0, TorusError::InvalidSampleSize);
 
     let token_state = &ctx.accounts.token_state;
@@ -41,19 +42,35 @@ pub fn handler(
     audit.control_total = control_total;
     audit.population_size = population_size;
     audit.committed_slot = Clock::get()?.slot;
+    // The sample's randomness is pinned here, before anyone can know it: the operator's seed commitment as posted,
+    // and a later slot whose hash does not exist yet.
+    audit.seed_commit = token_state.audit_seed_commit;
+    audit.entropy_slot = audit
+        .committed_slot
+        .checked_add(ENTROPY_DELAY_SLOTS)
+        .ok_or(TorusError::MathOverflow)?;
 
     // --- Snapshot the judging parameters and the obligation at commit ---
     //   finalize uses this snapshot and is unaffected by later changes to the manifest or the budget
     //   (no loosening thresholds after observations are known, no swapping the obligation afterwards,
     //    no swapping the auditor mid-cycle).
     audit.obligation = token_state.budget;
+    // The part judged, and when the issuer committed (excuses.rs). No auditor's excuse yet; finalize_audit decides
+    // whether the issuer did its part of the cycle on time.
+    audit.judged_obligation = token_state.judged_budget;
+    audit.committed_ts = Clock::get()?.unix_timestamp;
+    audit.auditor_excused_bps = 0;
+    audit.excuse_hash = [0u8; 32];
+    audit.issuer_on_time = false;
+    audit.held_up = false;
     audit.tolerance_bps = terms.tolerance_bps;
     audit.shortfall_tolerance_bps = terms.shortfall_tolerance_bps;
     audit.auditor = manifest.auditor;
-    // Fix the sample size here too (the value fixed in the manifest; if larger than the population, check all).
-    // Whoever designates the sample cannot choose its size.
-    audit.sample_size = (terms.sample_size as u32).min(population_size) as u16;
-    // Fix the allowed defect count; if the sample shrank to the whole population, keep it within 20% of it.
+    // Fix the sample size here too: the value fixed in the manifest, whatever the population. Samples are drawn with
+    // replacement in proportion to value, so a small population does not shrink the sample (declaring few leaves
+    // must not buy a weaker audit). A zero declaration has nothing to sample.
+    audit.sample_size = if control_total == 0 { 0 } else { terms.sample_size };
+    // Fix the allowed defect count, within 20% of the sample.
     audit.max_defects = terms.max_defects.min(
         ((audit.sample_size as u64) * MAX_DEFECT_RATE_BPS / BPS_DENOMINATOR) as u16,
     );
@@ -88,7 +105,7 @@ pub struct CommitPerformance<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// Current manifest: source of the auditor snapshotted into the cycle (the judging parameters come from
     /// TokenState.cycle_terms, the terms of the audited period).

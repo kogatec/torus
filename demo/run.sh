@@ -26,12 +26,19 @@ if lsof -iTCP:"$RPC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "port $RPC_PORT is already in use (another validator?). Stop it or set RPC_PORT."; exit 1
 fi
 
+# The example venue program (crates/torus-venue's showcase, demo/apiVenue.ts) is loaded when it has been built.
+VENUE_ARGS=()
+if [[ -f target/deploy/torus_venue_example.so && -f target/deploy/torus_venue_example-keypair.json ]]; then
+  VENUE_ARGS=(--upgradeable-program "$(solana address -k target/deploy/torus_venue_example-keypair.json)" target/deploy/torus_venue_example.so "$(solana address -k "$WALLET")")
+fi
+
 LEDGER="$(mktemp -d -t torus-demo-ledger)"
 solana-test-validator --reset --quiet --ledger "$LEDGER" \
   --rpc-port "$RPC_PORT" \
   --mint "$(solana address -k "$WALLET")" \
   --upgradeable-program "$PROTOCOL_ID" target/deploy/torus_protocol.so "$(solana address -k "$WALLET")" \
   --upgradeable-program "$HOOK_ID" target/deploy/torus_hook.so "$(solana address -k "$WALLET")" \
+  ${VENUE_ARGS[@]+"${VENUE_ARGS[@]}"} \
   >/dev/null 2>&1 &
 VALIDATOR_PID=$!
 cleanup() { kill "$VALIDATOR_PID" 2>/dev/null || true; wait "$VALIDATOR_PID" 2>/dev/null || true; rm -rf "$LEDGER"; }

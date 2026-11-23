@@ -64,20 +64,32 @@ pub fn handler<'info>(
     // ===== Split =====
     // What the redemption pool must hold = unpaid obligations + the budget the current period's volume will create.
     // Volume before metering starts (before the bond is full) is not counted.
+    // The open period's volume is valued at its realized rate, this conversion included.
+    let period_tokens = ts
+        .period_converted_tokens
+        .checked_add(token_amount)
+        .ok_or(TorusError::MathOverflow)?;
+    let period_usdc = ts
+        .period_converted_usdc
+        .checked_add(usdc_amount)
+        .ok_or(TorusError::MathOverflow)?;
     let accrued_budget = if ts.periods_started && !ts.exited {
         let (counter_total, _) =
             read_volume_counter(&ctx.accounts.volume_counter.to_account_info())?;
         // The open period's rate: the one in force when it started, none if it started between campaigns.
         let terms = ctx.accounts.manifest.terms_at(ts.period_start_ts);
         let rate = if ts.period_start_ts <= terms.valid_until { terms.return_rate_bps } else { 0 };
-        mul_bps(counter_total.saturating_sub(ts.current_period_activity), rate)?
+        let accruing = mul_bps(counter_total.saturating_sub(ts.current_period_activity), rate)?;
+        rules::value_at(accruing, (period_usdc, period_tokens))?
     } else {
         0
     };
+    // Both carries are owed (excuses.rs): what earlier cycles fell short of, and what was excused.
+    let carried = ts.unfulfilled.checked_add(ts.excused_carry).ok_or(TorusError::MathOverflow)?;
     let required = ts
         .reserved
         .checked_add(accrued_budget)
-        .and_then(|r| r.checked_add(if ts.exited { 0 } else { ts.unfulfilled }))
+        .and_then(|r| r.checked_add(if ts.exited { 0 } else { carried }))
         .ok_or(TorusError::MathOverflow)?;
 
     let bond_balance = ctx.accounts.slashing_bond.amount;
@@ -154,6 +166,8 @@ pub fn handler<'info>(
 
     // ===== Bookkeeping =====
     let ts = &mut ctx.accounts.token_state;
+    ts.period_converted_tokens = period_tokens;
+    ts.period_converted_usdc = period_usdc;
     if ts.exited {
         // After an exit the issuer's share goes to its customers: once liquidation has started with a basis, it is
         // added to the split (before that, start_liquidation counts it in the pool's surplus).

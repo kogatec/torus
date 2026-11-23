@@ -28,6 +28,7 @@ import {
   PublicKey,
   SystemProgram,
   SYSVAR_RENT_PUBKEY,
+  SYSVAR_SLOT_HASHES_PUBKEY,
   Transaction,
   TransactionInstruction,
   sendAndConfirmTransaction,
@@ -57,7 +58,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
-import { TorusClient, SumTree, sortByOutcome } from "../app/src/sdk";
+import { TorusClient, SumTree, sortByOutcome, seedCommitment } from "../app/src/sdk";
 
 // ============================================================================
 // Options
@@ -73,6 +74,8 @@ const STEP = flag("--step");
 const FAST = flag("--fast");
 const LINKS = flag("--links");
 const HOLD = flag("--hold");
+/** An extra scene kept in a separate file (it exports `run(tools)`). When set, only that scene runs. */
+const SCENE_FILE = arg("--scene-file");
 const ONLY: number[] | null = arg("--only")
   ? arg("--only")!
       .split(",")
@@ -109,6 +112,9 @@ const BOND_TARGET = u(2_000); // set by the operator for this company
 const MIN_PRICE = u(1); // a partner pays at least 1 USDC per brand token
 const TIER_SHARES = [2_000, 3_500, 5_000, 6_500]; // the issuer's share per rank, negotiated with this company
 const TAX_HOLD = 7 * 86_400; // a cycle waits a week for the tax accountant's reconciled report (fixed at initialize)
+const REVEAL_GRACE = 150; // slots (about a minute) the operator has to reveal its seed before anyone continues without it
+// Hash of the terms the local partner accepts when it takes the company on (the document is kept off-chain).
+const PARTNER_TERMS = Array.from(crypto.createHash("sha256").update("demo partner terms v1").digest());
 const TAX_BOOK = u(1_000_000_000); // the books cover every declared total in the demo
 const ALICE_SUPPLY = u(3_000_000); // minted to alice before issuance (afterwards only restamp mints)
 const UNIQ_BATCH = 6;
@@ -352,6 +358,7 @@ async function setupChain() {
   await fund(company.publicKey, sol.company);
   await fund(auditor.publicKey, sol.auditor);
   await fund(partner.publicKey, sol.partner);
+  await fund(cast.localPartner.publicKey, sol.partner); // the local partner issues the tokens and pays for their accounts
   for (const kp of [alice, bob, carol, dave, stranger]) await fund(kp.publicKey, sol.user);
 
   const configExists = !!(await connection.getAccountInfo(pdas.config()[0]));
@@ -383,6 +390,7 @@ async function setupChain() {
         treasuryUsdc,
         SAMPLE,
         new BN(MIN_BOND.toString()),
+        new BN(REVEAL_GRACE),
         new BN(TAX_HOLD),
       )
       .accounts({
@@ -400,6 +408,7 @@ async function setupChain() {
         config: pdas.config()[0],
         auditor: auditor.publicKey,
         auditorRecord: pdas.auditorRecord(auditor.publicKey)[0],
+        auditorRegistry: pdas.auditorRegistry()[0],
         systemProgram: SystemProgram.programId,
       })
       .rpc();
@@ -456,12 +465,13 @@ async function createBrandMint(opts: { freezeAuthority?: boolean } = {}): Promis
     createInitializeTransferFeeConfigInstruction(mintKp.publicKey, null, poolAuthority, FEE_BPS, MAX_FEE, TOKEN_2022_PROGRAM_ID),
     // hook authority revoked (zero key)
     createInitializeTransferHookInstruction(mintKp.publicKey, PublicKey.default, hook.programId, TOKEN_2022_PROGRAM_ID),
-    createInitializeMintInstruction(mintKp.publicKey, DEC, company.publicKey, opts.freezeAuthority ? company.publicKey : null, TOKEN_2022_PROGRAM_ID),
+    // the local partner is the mint authority: it issues the token under its own license
+    createInitializeMintInstruction(mintKp.publicKey, DEC, cast.localPartner.publicKey, opts.freezeAuthority ? company.publicKey : null, TOKEN_2022_PROGRAM_ID),
   );
   await sendAndConfirmTransaction(connection, tx, [company, mintKp]);
   // Supply for the customers, minted before issuance (issue_token moves the mint authority to the program).
   await mintToChecked(
-    connection, operator, mintKp.publicKey, await ata(mintKp.publicKey, alice.publicKey), company, ALICE_SUPPLY, DEC, [], undefined, TOKEN_2022_PROGRAM_ID,
+    connection, operator, mintKp.publicKey, await ata(mintKp.publicKey, alice.publicKey), cast.localPartner, ALICE_SUPPLY, DEC, [], undefined, TOKEN_2022_PROGRAM_ID,
   );
   await (hook.methods as any)
     .initializeExtraAccountMetaList()
@@ -480,7 +490,9 @@ async function issue(mint: PublicKey): Promise<string> {
   return pm
     .issueToken(FEE_BPS, new BN(MAX_FEE.toString()))
     .accounts({
-      issuer: company.publicKey,
+      partner: cast.localPartner.publicKey,
+      localPartnerRecord: pdas.localPartner(cast.localPartner.publicKey)[0],
+      company: company.publicKey,
       config: pdas.config()[0],
       mint,
       usdcMint,
@@ -495,7 +507,7 @@ async function issue(mint: PublicKey): Promise<string> {
       systemProgram: SystemProgram.programId,
       rent: SYSVAR_RENT_PUBKEY,
     })
-    .signers([company])
+    .signers([cast.localPartner])
     .rpc();
 }
 
@@ -515,17 +527,51 @@ async function setManifest(mint: PublicKey, auditorKey: PublicKey, periodLen = P
     .rpc();
 }
 
+/**
+ * The operator's seed for a token's `round`-th sample. Derived from the operator's secret key, so only the operator
+ * can compute it and nothing has to be stored between runs.
+ */
+function auditSeed(mint: PublicKey, round: number): number[] {
+  const roundLe = Buffer.alloc(4);
+  roundLe.writeUInt32LE(round, 0);
+  return Array.from(crypto.createHash("sha256").update(Buffer.from(operator.secretKey)).update(mint.toBuffer()).update(roundLe).digest());
+}
+
+/** The round whose seed commitment is the one on-chain (the operator's next reveal). */
+function seedRoundOf(mint: PublicKey, commit: number[]): number {
+  for (let round = 0; round < 10_000; round++) {
+    if (Buffer.from(seedCommitment(auditSeed(mint, round))).equals(Buffer.from(commit))) return round;
+  }
+  throw new Error("the seed commitment on-chain is not one of this operator's");
+}
+
 async function setTerms(mint: PublicKey, signer: Keypair = operator) {
+  // The local partner signs too: it takes the company on under its own license.
   const sig = await pm
-    .setIssuerTerms(new BN(BOND_TARGET.toString()), new BN(MIN_PRICE.toString()), TIER_SHARES)
+    .setIssuerTerms(new BN(BOND_TARGET.toString()), new BN(MIN_PRICE.toString()), TIER_SHARES, PARTNER_TERMS)
     .accounts({
       authority: signer.publicKey,
       config: pdas.config()[0],
       tokenState: pdas.tokenState(mint)[0],
+      localPartner: cast.localPartner.publicKey,
       localPartnerRecord: pdas.localPartner(cast.localPartner.publicKey)[0],
     })
-    .signers(signer === operator ? [] : [signer])
+    .signers(signer === operator ? [cast.localPartner] : [signer, cast.localPartner])
     .rpc();
+  await afterTerms(mint);
+  return sig;
+}
+
+/** After the terms are set: the operator commits to its seed for the first sample (and the books' reconciler is set up). */
+async function afterTerms(mint: PublicKey) {
+  // The operator commits to its seed for the first sample before any period closes.
+  const posted: any = await accounts.tokenState.fetch(pdas.tokenState(mint)[0]);
+  if ((posted.auditSeedCommit as number[]).every((b) => b === 0)) {
+    await pm
+      .setAuditSeed(seedCommitment(auditSeed(mint, 0)))
+      .accounts({ authority: operator.publicKey, config: pdas.config()[0], tokenState: pdas.tokenState(mint)[0] })
+      .rpc();
+  }
   // The company's tax accountant: registered by the operator with the accountant's signature.
   if (!(await accounts.taxAccountantRecord.fetchNullable(pdas.taxAccountant(mint)[0]))) {
     await pm
@@ -541,7 +587,6 @@ async function setTerms(mint: PublicKey, signer: Keypair = operator) {
       .signers([cast.taxAccountant])
       .rpc();
   }
-  return sig;
 }
 
 /** The tax accountant reports the book total for the cycle just provisioned. */
@@ -706,7 +751,8 @@ function buildLedger(values: number[], ids?: Buffer[]) {
   return { tree: new SumTree(sorted), rows: sorted };
 }
 
-async function commit(mint: PublicKey, periodId: BN, tree: SumTree) {
+/** The commit_performance call for a ledger, before anyone signs it (the issuer signs it: here, or through the API). */
+async function commitCall(mint: PublicKey, periodId: BN, tree: SumTree) {
   const m: any = await accounts.manifest.fetch(pdas.manifest(mint)[0]);
   return pm
     .commitPerformance(tree.commitmentArray(), new BN(tree.total.toString()), tree.populationSize)
@@ -717,9 +763,16 @@ async function commit(mint: PublicKey, periodId: BN, tree: SumTree) {
       auditorRecord: pdas.auditorRecord(m.auditor)[0],
       audit: pdas.audit(mint, periodId)[0],
       systemProgram: SystemProgram.programId,
-    })
-    .signers([company])
-    .rpc();
+    });
+}
+
+async function commit(mint: PublicKey, periodId: BN, tree: SumTree) {
+  return (await commitCall(mint, periodId, tree)).signers([company]).rpc();
+}
+
+/** The commit_performance instruction, unsigned (the worker builds the transaction; the company signs it through the API). */
+async function commitInstruction(mint: PublicKey, periodId: BN, tree: SumTree) {
+  return (await commitCall(mint, periodId, tree)).instruction();
 }
 
 async function verifyUniqueness(mint: PublicKey, periodId: BN, tree: SumTree) {
@@ -730,22 +783,34 @@ async function verifyUniqueness(mint: PublicKey, periodId: BN, tree: SumTree) {
   }
 }
 
-/** The operator supplies randomness only after the commit is on-chain (a VRF in production). */
-async function designate(mint: PublicKey, periodId: BN): Promise<number[]> {
+/**
+ * Fixes the sample. Nobody supplies the randomness: it mixes the hash of a slot fixed at commit (captured once that
+ * slot exists) with the seed the operator committed to before the ledger was committed. Samples are positions of
+ * the ledger's running sum, so a payment is drawn in proportion to its amount. (A VRF in production.)
+ */
+async function designate(mint: PublicKey, periodId: BN, tree: SumTree): Promise<number[]> {
   const auditPda = pdas.audit(mint, periodId)[0];
   const committed: any = await accounts.auditCycle.fetch(auditPda);
-  while ((await connection.getSlot("confirmed")) <= (committed.committedSlot as BN).toNumber()) await sleep(200);
+  while ((await connection.getSlot("confirmed")) <= (committed.entropySlot as BN).toNumber()) await sleep(200);
+  if ((committed.capturedSlot as BN).isZero()) {
+    await pm
+      .captureEntropy()
+      .accounts({ crank: operator.publicKey, audit: auditPda, slotHashes: SYSVAR_SLOT_HASHES_PUBKEY })
+      .rpc();
+  }
+  const round = seedRoundOf(mint, committed.seedCommit);
   await pm
-    .designateSample(Array.from(crypto.randomBytes(32)))
-    .accounts({ crank: operator.publicKey, config: pdas.config()[0], audit: auditPda })
+    .designateSample(auditSeed(mint, round), seedCommitment(auditSeed(mint, round + 1)))
+    .accounts({ crank: operator.publicKey, config: pdas.config()[0], audit: auditPda, tokenState: pdas.tokenState(mint)[0], auditorRegistry: pdas.auditorRegistry()[0] })
     .rpc();
   const a: any = await accounts.auditCycle.fetch(auditPda);
-  return (a.sampleIndices as any[]).map((i) => Number(i));
+  return tree.sampledLeaves(a.entropy, a.sampleSize);
 }
 
-async function disclose(mint: PublicKey, periodId: BN, tree: SumTree, index: number) {
+async function disclose(mint: PublicKey, periodId: BN, tree: SumTree, index: number, proof = tree.proof(index)) {
+  const leaf = { index, outcomeId: tree.outcomeAt(index), beneficiary: tree.beneficiaryAt(index), value: new BN(tree.valueAt(index).toString()) };
   return pm
-    .verifyDisclosure(tree.outcomeAt(index), tree.beneficiaryAt(index), new BN(tree.valueAt(index).toString()), tree.proof(index))
+    .verifyDisclosure(leaf, proof)
     .accounts({ crank: operator.publicKey, audit: pdas.audit(mint, periodId)[0] })
     .rpc();
 }
@@ -805,11 +870,11 @@ async function attest(mint: PublicKey, periodId: BN, tree: SumTree, index: numbe
 }
 
 /** Anyone may submit a claim for a ledger entry; the money can only go to that entry's merchant. */
-async function claim(mint: PublicKey, periodId: BN, tree: SumTree, index: number, toUsdc: PublicKey, crank: Keypair = dave) {
+async function claim(mint: PublicKey, periodId: BN, tree: SumTree, index: number, toUsdc: PublicKey, crank: Keypair = dave, proof = tree.proof(index)) {
   const audit = pdas.audit(mint, periodId)[0];
   const attestation = pdas.attestation(audit, index)[0];
   return pm
-    .payout(index, tree.outcomeAt(index), new BN(tree.valueAt(index).toString()), tree.proof(index))
+    .payout(index, tree.outcomeAt(index), new BN(tree.valueAt(index).toString()), proof)
     .accounts({
       crank: crank.publicKey,
       config: pdas.config()[0],
@@ -834,20 +899,21 @@ const RESULT: Record<number, string> = {
   3: "FRAUD (under-reported / defaulted)",
   4: "HONEST SHORTFALL",
   5: "UNDER-DELIVERED (honest: not slashed)",
+  7: "EXCUSED (not judged: the company could not deliver through no fault of its own; carried)",
 };
 
 /** Launch a brand token with the bond and pool pre-funded by a deposit, and close one traded period. */
-async function quickLaunch(symbol: string): Promise<{ mint: PublicKey; periodId: BN; budget: bigint }> {
+async function quickLaunch(symbol: string, volume: bigint = u(500_000)): Promise<{ mint: PublicKey; periodId: BN; budget: bigint }> {
   const mint = await createBrandMint();
   await issue(mint);
   await setManifest(mint, auditor.publicKey);
   await setTerms(mint);
   await deposit(mint, BOND_TARGET + u(1_500)); // bond first, the rest to the redemption pool
   await provision(mint); // bond is full → metering starts here
-  const dst = await trade(mint, alice, bob.publicKey, u(500_000));
+  const dst = await trade(mint, alice, bob.publicKey, volume);
   await harvest(mint, [dst]);
   const p = await provisionUntilBudget(mint);
-  await line(gray(`  (${symbol}: registered · bond ${usdc(BOND_TARGET)} · 500,000 ${symbol} traded · obligation ${usdc(p.budget)})`));
+  await line(gray(`  (${symbol}: registered · bond ${usdc(BOND_TARGET)} · ${tok(volume, symbol)} traded · obligation ${usdc(p.budget)})`));
   return { mint, ...p };
 }
 
@@ -866,8 +932,8 @@ async function commitAndSample(mint: PublicKey, periodId: BN, values: number[], 
   if (opts.skipUniqueness) return { ...ledger, sample: [] as number[] };
   await verifyUniqueness(mint, periodId, tree);
   await ok(`Every payment ID is unique and registered`, "(a payment cannot be counted twice, now or in a later period)");
-  const sample = await designate(mint, periodId);
-  await ok(`Random sample drawn after the commit: payments ${sample.map((i) => "#" + i).join(", ")}`, "(the company could not pick them)");
+  const sample = await designate(mint, periodId, tree);
+  await ok(`Random sample drawn after the commit: payments ${sample.map((i) => "#" + i).join(", ")}`, "(neither the company nor the operator could pick them)");
   return { ...ledger, sample };
 }
 
@@ -1129,6 +1195,31 @@ async function scene6() {
   await info("Under-reporting never makes an obligation disappear; claiming more than was delivered is what gets slashed.");
 }
 
+// ============================================================================
+// Extra scene from a separate file (--scene-file <path>)
+// ============================================================================
+
+/** What an extra scene may use: the SDK types, the cast, the helpers above and the printing functions. */
+function sceneTools() {
+  return {
+    BN, Keypair, PublicKey, Transaction, SumTree, RETURN_RATE_BPS, RESULT, connection, operator, company, alice, bob, dave, usdcMint,
+    bs58: anchor.utils.bytes.bs58, programId: program.programId, hookProgramId: hook.programId, pdas, client, commitInstruction,
+    pm, localPartner: cast.localPartner, afterTerms, auditor, accounts, PERIOD_LEN,
+    ComputeBudgetProgram, sendAndConfirmTransaction,
+    u, usdc, tok, bal, line, step, ok, info, alert, link, bold, gray, green,
+    quickLaunch, commit, verifyUniqueness, designate, disclose, observe, finalize, auditOf, claim,
+    trade, harvest, deposit, provision, provisionUntilBudget, tokenState, waitPeriod,
+    createAssociatedTokenAccountIdempotent,
+  };
+}
+
+/** Runs the scene a separate file exports as `run(tools)`. */
+async function extraScene(file: string) {
+  const scene = await import(path.resolve(file));
+  if (typeof scene.run !== "function") throw new Error(`--scene-file: ${file} does not export run(tools)`);
+  await scene.run(sceneTools());
+}
+
 async function finale(ran: number[]) {
   if (STEP) await waitEnter("\n  [Enter] summary ");
   await nextSegment(7);
@@ -1178,6 +1269,10 @@ async function main() {
   segmentStart = showStart;
   timings[0] = 0;
 
+  if (SCENE_FILE) {
+    await extraScene(SCENE_FILE);
+    return;
+  }
   for (const [n, fn] of scenes) if (run.includes(n)) await fn();
   await finale(run);
   if (MIN_MS && MIN_MS[7] !== undefined) await sleep(Math.max(0, segmentStart + MIN_MS[7] - Date.now()));

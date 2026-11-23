@@ -34,7 +34,7 @@ use spl_tlv_account_resolution::{
 };
 use spl_transfer_hook_interface::instruction::{ExecuteInstruction, TransferHookInstruction};
 
-declare_id!("9LtyE8m84qUm9qeyLSLzTJUC3cUXNvL2HVp9ctqdi21a");
+declare_id!("4Du4ZzQ5Z84yQDUqesfwXeHTC2wxfectgWjAyQ6RgLSi");
 
 /// Program ID of torus-protocol (the core program).
 /// The TokenState PDA (seeds = [b"token_state", mint]) is **owned by that program**, a different program from
@@ -43,7 +43,7 @@ declare_id!("9LtyE8m84qUm9qeyLSLzTJUC3cUXNvL2HVp9ctqdi21a");
 ///
 /// After `anchor keys sync`, update this **by hand** to torus-protocol's key
 ///   (keys sync does not update it; it must equal declare_id! in torus-protocol/src/lib.rs).
-pub const TORUS_PROTOCOL_ID: Pubkey = pubkey!("6n1Nme9H1aUoXY2P2RaHBVWKAHHyEVPjx9n8WdU8oGdR");
+pub const TORUS_PROTOCOL_ID: Pubkey = pubkey!("FL22UpMorhRRh8aXH8NRRR82PG2mQoBeoekqcTrC7nc3");
 
 // ============================================================================
 //  Byte offsets for reading TokenState by hand (following torus-protocol/src/state.rs)

@@ -98,7 +98,7 @@ pub struct DepositPool<'info> {
         seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()],
         bump = token_state.bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// Second account: slashing bond (USDC), filled first.
     #[account(

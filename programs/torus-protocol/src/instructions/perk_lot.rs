@@ -34,7 +34,8 @@ pub fn list(ctx: Context<ListPerk>, amount: u64) -> Result<()> {
     require!(pp.max_ask_bps > 0 && pp.usage_cap_bps > 0, TorusError::PerkListingClosed);
     let record: HolderRecord =
         load_if_exists(&ctx.accounts.holder_record, &torus_hook::ID)?.ok_or(TorusError::HolderNotRegistered)?;
-    let listable = mul_bps(record.sent.in_period(last), pp.listable_rate_bps)?;
+    let sent = rules::value_at(record.sent.in_period(last), (pp.rate_usdc, pp.rate_tokens))?;
+    let listable = mul_bps(sent, pp.listable_rate_bps)?;
 
     let hp = &mut ctx.accounts.holder_perk;
     hp.enter_period(period);

@@ -8,7 +8,9 @@
 //! - tier_share_bps: the issuer's share of converted fees for ranks 0..=3, negotiated per company. Only the rule
 //!   "at most 100%, never less for a higher rank" is fixed in code.
 //! - the local partner (a registered, active one): operates the company's restamps and takes its share of the
-//!   operator's fee.
+//!   operator's fee. **It signs this instruction too**: the partner issues and serves the company's token under its
+//!   own license, so it is on record that it took this company on, together with the hash of the terms it accepted.
+//!   The operator cannot assign a company to a partner that has not agreed, and cannot change the terms behind its back.
 //!
 //! While any of these is unset, no deposit, conversion or redemption can start.
 
@@ -24,9 +26,10 @@ pub fn handler(
     bond_target: u64,
     min_conversion_price: u64,
     tier_share_bps: [u16; TIERS],
+    partner_terms_hash: [u8; 32],
 ) -> Result<()> {
     require!(
-        bond_target > 0 && min_conversion_price > 0,
+        bond_target > 0 && min_conversion_price > 0 && partner_terms_hash != [0u8; 32],
         TorusError::InvalidIssuerTerms
     );
     // The minimum is fixed by the operator at initialize (no large promises on a tiny bond).
@@ -41,6 +44,7 @@ pub fn handler(
     ts.tier_share_bps = tier_share_bps;
     ts.distribution_ratio_bps = tier_share_bps[ts.tier as usize];
     ts.local_partner = ctx.accounts.local_partner_record.partner;
+    ts.partner_terms_hash = partner_terms_hash;
     msg!(
         "set_issuer_terms: mint={} bond_target={} min_conversion_price={} tier_share_bps={:?} local_partner={}",
         ts.mint,
@@ -69,9 +73,15 @@ pub struct SetIssuerTerms<'info> {
         seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()],
         bump = token_state.bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
-    /// The company's local partner (registered by the operator, still active).
-    #[account(constraint = local_partner_record.active @ TorusError::LocalPartnerNotRegistered)]
+    /// The company's local partner, signing that it takes this company on under these terms.
+    pub local_partner: Signer<'info>,
+
+    /// Its registry record (registered by the operator, still active).
+    #[account(
+        constraint = local_partner_record.active @ TorusError::LocalPartnerNotRegistered,
+        constraint = local_partner_record.partner == local_partner.key() @ TorusError::Unauthorized,
+    )]
     pub local_partner_record: Account<'info, LocalPartnerRecord>,
 }

@@ -6,12 +6,12 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-torus_protocol = "6n1Nme9H1aUoXY2P2RaHBVWKAHHyEVPjx9n8WdU8oGdR"
-torus_hook = "9LtyE8m84qUm9qeyLSLzTJUC3cUXNvL2HVp9ctqdi21a"
+torus_protocol = "FL22UpMorhRRh8aXH8NRRR82PG2mQoBeoekqcTrC7nc3"
+torus_hook = "4Du4ZzQ5Z84yQDUqesfwXeHTC2wxfectgWjAyQ6RgLSi"
 
 [programs.devnet]
-torus_protocol = "6n1Nme9H1aUoXY2P2RaHBVWKAHHyEVPjx9n8WdU8oGdR"
-torus_hook = "9LtyE8m84qUm9qeyLSLzTJUC3cUXNvL2HVp9ctqdi21a"
+torus_protocol = "FL22UpMorhRRh8aXH8NRRR82PG2mQoBeoekqcTrC7nc3"
+torus_hook = "4Du4ZzQ5Z84yQDUqesfwXeHTC2wxfectgWjAyQ6RgLSi"
 
 [registry]
 url = "https://api.apr.dev"

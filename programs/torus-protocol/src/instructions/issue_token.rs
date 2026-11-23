@@ -13,6 +13,10 @@
 //! USDC is a classic SPL token, so the pool accounts use `usdc_token_program`
 //! (a different program from the brand token's Token-2022).
 //!
+//! [Who issues] The company's local partner signs: it issues the token under its own license (it is the mint authority
+//! and pays for the accounts). The company is named as the obligor: it fixes the promise (set_manifest) and commits the
+//! ledgers, and it accepts by signing its manifest. The operator issues nothing.
+//!
 //! [Mint authority] At the end the mint authority moves from the issuer to the pool PDA, so the issuer can no longer
 //! mint at will. Afterwards only restamp mints, signed by the holder and the local partner, and only as much as it
 //! burned in the same instruction: the supply never grows.
@@ -33,7 +37,7 @@ use anchor_lang::solana_program::program_option::COption;
 
 use crate::constants::*;
 use crate::errors::TorusError;
-use crate::state::{Config, TokenState};
+use crate::state::{Config, LocalPartnerRecord, TokenState};
 
 pub fn handler(
     ctx: Context<IssueToken>,
@@ -47,10 +51,10 @@ pub fn handler(
         TorusError::NonUsdcCollateral
     );
 
-    // (a0) The issuer must be the mint authority. Otherwise anyone could register someone else's mint built for
-    //      Torus first and control its manifest (auditor, thresholds).
+    // (a0) The partner must be the mint authority. Otherwise anyone could register someone else's mint built for
+    //      Torus first and name the company that controls its manifest (auditor, thresholds).
     require!(
-        ctx.accounts.mint.mint_authority == COption::Some(ctx.accounts.issuer.key()),
+        ctx.accounts.mint.mint_authority == COption::Some(ctx.accounts.partner.key()),
         TorusError::MintAuthorityNotIssuer
     );
     // (a0) No freeze authority. Otherwise the issuer could freeze the fee vault or holders' accounts and put its key
@@ -139,7 +143,7 @@ pub fn handler(
     }
 
     let ts = &mut ctx.accounts.token_state;
-    ts.issuer = ctx.accounts.issuer.key();
+    ts.issuer = ctx.accounts.company.key();
     ts.mint = ctx.accounts.mint.key();
     ts.usdc_mint = ctx.accounts.usdc_mint.key();
 
@@ -147,7 +151,8 @@ pub fn handler(
     ts.consecutive_passes = 0;
     ts.distribution_ratio_bps = 0; // the issuer's share per rank is set by the operator with set_issuer_terms.
     ts.tier_share_bps = [0; TIERS];
-    ts.local_partner = Pubkey::default();
+    ts.local_partner = ctx.accounts.partner.key();
+    ts.mint_decimals = ctx.accounts.mint.decimals;
 
     ts.prior_period_activity = 0;
     ts.current_period_activity = 0;
@@ -178,12 +183,12 @@ pub fn handler(
     ts.issuer_claimable = 0;
     ts.reserved = 0;
 
-    // The mint authority moves to the pool PDA (the issuer signs as the current authority).
+    // The mint authority moves to the pool PDA (the partner signs as the current authority).
     set_authority(
         CpiContext::new(
             ctx.accounts.token_2022_program.to_account_info(),
             SetAuthority {
-                current_authority: ctx.accounts.issuer.to_account_info(),
+                current_authority: ctx.accounts.partner.to_account_info(),
                 account_or_mint: ctx.accounts.mint.to_account_info(),
             },
         ),
@@ -192,38 +197,51 @@ pub fn handler(
     )?;
 
     msg!(
-        "issue_token: mint={} issuer={} (USDC pool initialized; bond target is set by the operator)",
+        "issue_token: mint={} company={} partner={} (USDC pool initialized; bond target is set by the operator)",
         ts.mint,
-        ts.issuer
+        ts.issuer,
+        ts.local_partner
     );
     Ok(())
 }
 
 #[derive(Accounts)]
 pub struct IssueToken<'info> {
-    /// The issuer, payer.
+    /// The local partner issuing the token under its license: the mint authority, the payer.
     #[account(mut)]
-    pub issuer: Signer<'info>,
+    pub partner: Signer<'info>,
+
+    /// Its registry record (registered by the operator, still active).
+    #[account(
+        seeds = [LOCAL_PARTNER_SEED, partner.key().as_ref()],
+        bump = local_partner_record.bump,
+        constraint = local_partner_record.active @ TorusError::LocalPartnerNotRegistered,
+    )]
+    pub local_partner_record: Box<Account<'info, LocalPartnerRecord>>,
+
+    /// The company the token is issued for (the obligor: it fixes the promise and commits the ledgers).
+    /// CHECK: only the key is recorded; the company accepts by signing its manifest.
+    pub company: UncheckedAccount<'info>,
 
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 
     /// The Token-2022 mint created client-side (with TransferFee and TransferHook).
     /// Its extensions are verified in the handler; its mint authority moves to the pool PDA.
     #[account(mut)]
-    pub mint: InterfaceAccount<'info, Mint>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// Pool currency (USDC).
-    pub usdc_mint: InterfaceAccount<'info, Mint>,
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(
         init,
-        payer = issuer,
+        payer = partner,
         space = 8 + TokenState::INIT_SPACE,
         seeds = [TOKEN_STATE_SEED, mint.key().as_ref()],
         bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// Pool PDA (authority of the pool accounts).
     /// CHECK: bound by seeds; holds no data, only signs.
@@ -236,51 +254,51 @@ pub struct IssueToken<'info> {
     /// First account: redemption pool (USDC).
     #[account(
         init,
-        payer = issuer,
+        payer = partner,
         seeds = [REDEMPTION_VAULT_SEED, mint.key().as_ref()],
         bump,
         token::mint = usdc_mint,
         token::authority = pool_authority,
         token::token_program = usdc_token_program,
     )]
-    pub redemption_vault: InterfaceAccount<'info, TokenAccount>,
+    pub redemption_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Second account: slashing bond (USDC).
     #[account(
         init,
-        payer = issuer,
+        payer = partner,
         seeds = [SLASHING_BOND_SEED, mint.key().as_ref()],
         bump,
         token::mint = usdc_mint,
         token::authority = pool_authority,
         token::token_program = usdc_token_program,
     )]
-    pub slashing_bond: InterfaceAccount<'info, TokenAccount>,
+    pub slashing_bond: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Issuer escrow (USDC). The issuer cannot withdraw until the audit finalizes without fraud.
     #[account(
         init,
-        payer = issuer,
+        payer = partner,
         seeds = [ISSUER_ESCROW_SEED, mint.key().as_ref()],
         bump,
         token::mint = usdc_mint,
         token::authority = pool_authority,
         token::token_program = usdc_token_program,
     )]
-    pub issuer_escrow: InterfaceAccount<'info, TokenAccount>,
+    pub issuer_escrow: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Where collected fees (brand token) are swept. PDA-owned, no issuer key involved.
     /// `withdraw_withheld_authority` was checked to be pool_authority above.
     #[account(
         init,
-        payer = issuer,
+        payer = partner,
         seeds = [FEE_VAULT_SEED, mint.key().as_ref()],
         bump,
         token::mint = mint,
         token::authority = pool_authority,
         token::token_program = token_2022_program,
     )]
-    pub fee_vault: InterfaceAccount<'info, TokenAccount>,
+    pub fee_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Token program of the brand token (Token-2022).
     pub token_2022_program: Interface<'info, TokenInterface>,

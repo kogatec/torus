@@ -52,7 +52,7 @@ pub struct RegisterTaxAccountant<'info> {
     pub config: Account<'info, Config>,
 
     #[account(seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()], bump = token_state.bump)]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// The accountant signs its consent. Never the issuer's key.
     #[account(constraint = accountant.key() != token_state.issuer @ TorusError::Unauthorized)]
@@ -95,7 +95,7 @@ pub struct ReplaceTaxAccountant<'info> {
     pub config: Account<'info, Config>,
 
     #[account(seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()], bump = token_state.bump)]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// The new accountant signs its consent. Never the issuer's key.
     #[account(constraint = accountant.key() != token_state.issuer @ TorusError::Unauthorized)]

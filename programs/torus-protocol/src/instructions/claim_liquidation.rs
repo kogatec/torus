@@ -32,7 +32,7 @@ pub fn handler(
     );
 
     let beneficiary = ctx.accounts.beneficiary_usdc.owner;
-    let (root, sum) = fold_sum_proof(
+    let proof = fold_sum_proof(
         index,
         &outcome_id,
         &beneficiary,
@@ -41,7 +41,7 @@ pub fn handler(
         audit.population_size,
     )?;
     require!(
-        root == audit.commitment_value && sum == audit.control_total,
+        proof.commitment == audit.commitment_value && proof.root_sum == audit.control_total,
         TorusError::ClaimProofInvalid
     );
 

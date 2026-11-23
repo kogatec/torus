@@ -1,7 +1,8 @@
 //! On-chain state accounts.
 
 use anchor_lang::prelude::*;
-use crate::constants::{HOLD_STEPS, MAX_SAMPLE_SIZE, MAX_UNIQ_STACK, TIERS};
+use crate::constants::{HOLD_STEPS, MAX_AUDITOR_ENTRIES, MAX_SAMPLE_SIZE, MAX_UNIQ_STACK, TIERS};
+use crate::errors::TorusError;
 
 /// Protocol-wide configuration (singleton PDA).
 #[account]
@@ -23,6 +24,9 @@ pub struct Config {
     pub treasury: Pubkey,
     /// Minimum bond target (fixed at initialize). set_issuer_terms rejects anything lower.
     pub min_bond_target: u64,
+    /// Slots the operator has to reveal its seed after a cycle's slot hash is captured. After that anyone fixes the
+    /// sample without the seed (with a doubled sample), so the operator cannot stall an audit.
+    pub reveal_grace_slots: u64,
     /// How long a cycle waits for the tax accountant's reconciled report when the declared total exceeds the book
     /// total (seconds). Fixed by the operator at initialize; no company can change it.
     pub tax_hold_period: i64,
@@ -32,7 +36,8 @@ pub struct Config {
 #[account]
 #[derive(InitSpace)]
 pub struct TokenState {
-    /// The issuer (the company).
+    /// The company: the obligor that fixes the promise and commits the ledgers. The token itself is issued by its
+    /// local partner (local_partner), which signs issue_token.
     pub issuer: Pubkey,
     /// Token-2022 mint (with TransferFee and TransferHook extensions).
     pub mint: Pubkey,
@@ -94,8 +99,10 @@ pub struct TokenState {
     pub last_settled_harvested: u64,
     /// Transfer fee rate (bps) burned into the mint, as verified by issue_token.
     pub transfer_fee_bps: u16,
-    /// Deadline of the current audit (Unix seconds), set by provision_budget to provision time + period length.
-    /// If the commitment, disclosures or uniqueness proof are still missing after it, anyone can declare a default.
+    /// Deadline of the current audit (Unix seconds): set by provision_budget to one period after the provisioned
+    /// period's window ends (or after the provision, when that window is already over), and moved to at least one
+    /// period after the sample is drawn or the auditor replaced. If the commitment, disclosures or uniqueness proof are
+    /// still missing after it, anyone can declare a default.
     pub audit_deadline: i64,
 
     // ---- Splitting converted fees (operator share / issuer share → bond → redemption pool → escrow) ----
@@ -168,12 +175,66 @@ pub struct TokenState {
     pub tier_share_bps: [u16; TIERS],
     /// The company's local partner (operates restamps; takes its share of the operator's fee). Default = not set.
     pub local_partner: Pubkey,
+
+    // ---- The partner's acceptance and the sample's randomness ----
+    /// Hash of the terms the local partner signed when it took this company on (the document is kept off-chain).
+    pub partner_terms_hash: [u8; 32],
+    /// Commitment to the operator's seed for the next sample (sampling::seed_commitment). It is fixed before the
+    /// issuer commits its ledger and the seed is revealed only after the cycle's slot hash is captured, so neither
+    /// the operator nor the issuer steers the sample alone. All zero = not posted yet (no period closes until it is).
+    pub audit_seed_commit: [u8; 32],
+
+    // ---- Valuing volume in the pool's currency ----
+    // Volume is metered in brand tokens, the pool holds USDC. An obligation is the period's volume × the return rate,
+    // valued at the rate the period's fees were actually converted at.
+    /// Decimals of the brand token (read from the mint at issuance).
+    pub mint_decimals: u8,
+    /// Fee tokens converted, and the USDC paid for them, since the last provision: the open period's realized rate.
+    pub period_converted_tokens: u64,
+    pub period_converted_usdc: u64,
+    /// The same totals for the last period that had a conversion (used while the open period has none).
+    pub rate_tokens: u64,
+    pub rate_usdc: u64,
+
+    // ---- Periods the issuer could not deliver in (excuses.rs) ----
+    /// The part of `budget` the issuer is judged on (commit_performance snapshots it into the cycle).
+    pub judged_budget: u64,
+    /// When the current period was provisioned (its commit was not possible before).
+    pub provisioned_ts: i64,
+    /// Obligation carried from excused periods: still owed (added to the next budget, escrowed, deliverable), never
+    /// judged again.
+    pub excused_carry: u64,
 }
 
 impl TokenState {
     /// Index of the period containing `now` on the fixed grid (0 before metering starts), as the hook computes it.
     pub fn grid_index(&self, now: i64) -> u64 {
         torus_hook::grid_index(now, self.grid_start_ts, self.grid_period_len)
+    }
+
+    /// Rate (USDC, per tokens) at which token amounts are valued: the open period's conversions, else those of the
+    /// last period that had any, else the operator's minimum conversion price (USDC per whole token).
+    pub fn valuation_rate(&self) -> Result<(u64, u64)> {
+        if self.period_converted_tokens > 0 {
+            return Ok((self.period_converted_usdc, self.period_converted_tokens));
+        }
+        if self.rate_tokens > 0 {
+            return Ok((self.rate_usdc, self.rate_tokens));
+        }
+        let whole_token = 10u64
+            .checked_pow(self.mint_decimals as u32)
+            .ok_or(TorusError::MathOverflow)?;
+        Ok((self.min_conversion_price, whole_token))
+    }
+
+    /// Closes the open period's conversions: they become the rate of record and the next period starts empty.
+    pub fn roll_conversion_rate(&mut self) {
+        if self.period_converted_tokens > 0 {
+            self.rate_tokens = self.period_converted_tokens;
+            self.rate_usdc = self.period_converted_usdc;
+            self.period_converted_tokens = 0;
+            self.period_converted_usdc = 0;
+        }
     }
 }
 
@@ -278,11 +339,15 @@ pub struct AuditCycle {
     pub shortfall_tolerance_bps: u16,
 
     // --- Sample designation ---
-    /// Entropy fixed after the commitment (a VRF in production).
+    /// Entropy of the sample: the operator's seed mixed with slot_hash (sampling::mix_entropy). Sample j is the
+    /// position sampling::sample_position(entropy, j, control_total) of the ledger's running sum.
     pub entropy: [u8; 32],
-    /// Slot at which the entropy was fixed (must be after committed_slot).
+    /// Slot whose hash feeds the entropy: fixed at commit as a slot after it, so its hash is not known yet. Moved
+    /// only when that hash was not captured while it could still be read (the sample is then doubled).
     pub entropy_slot: u64,
+    /// Number of samples (with replacement). Zero for a zero control total.
     pub sample_size: u16,
+    /// Index of the leaf disclosed for each sample, in sample order (filled by verify_disclosure).
     #[max_len(MAX_SAMPLE_SIZE)]
     pub sample_indices: Vec<u32>,
 
@@ -323,12 +388,34 @@ pub struct AuditCycle {
     /// Whether uniqueness has been verified (payment IDs strictly increasing over all leaves, root matching,
     /// every ID registered as used).
     pub uniqueness_verified: bool,
+    /// The operator's seed commitment, snapshotted from TokenState at commit (so it predates the slot hash).
+    pub seed_commit: [u8; 32],
+    /// Hash of the block at entropy_slot, captured by capture_entropy.
+    pub slot_hash: [u8; 32],
+    /// Slot at which slot_hash was captured (0 = not yet). The operator's reveal grace runs from here.
+    pub captured_slot: u64,
     /// End of the hold set by finalize_audit when the declared total exceeded the tax accountant's book total
     /// (0 = no hold). Payouts wait; a reconciled report within the hold resumes the cycle, none forfeits it.
     pub tax_hold_until: i64,
     /// Total recognized when the cycle was finalized without fraud: the control total, or the book total when the tax
     /// reconciliation capped it. Each payout is scaled by it ÷ the control total (tax_rules::recognized_share).
     pub recognized_total: u64,
+
+    // ---- Periods the issuer could not deliver in (excuses.rs) ----
+    /// When the issuer committed (unix seconds): finalize_audit checks whether it did its part of the cycle on time.
+    pub committed_ts: i64,
+    /// The part of the obligation the issuer is judged on (TokenState.judged_budget at commit).
+    pub judged_obligation: u64,
+    /// Share of the judged obligation the cycle's auditor excused (bps) for a cause the chain cannot see, and the hash of
+    /// its reasons (excuse_shortfall). Cleared when the auditor is replaced.
+    pub auditor_excused_bps: u16,
+    pub excuse_hash: [u8; 32],
+    /// Whether the issuer did its own part of this cycle on time (set by finalize_audit). The next provision excuses a
+    /// period whose window was over before it could be provisioned only when this holds.
+    pub issuer_on_time: bool,
+    /// Whether someone other than the issuer held this cycle up: its auditor was replaced before finalization, or its
+    /// sample was drawn without the operator's seed.
+    pub held_up: bool,
 }
 
 /// Registered independent auditor (registered by the operator, Config.authority).
@@ -338,6 +425,25 @@ pub struct AuditCycle {
 pub struct AuditorRecord {
     pub auditor: Pubkey,
     pub active: bool,
+    pub bump: u8,
+}
+
+/// One auditor in the registry: the slots at which it was added and revoked (AUDITOR_NOT_REMOVED while active).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug, InitSpace)]
+pub struct AuditorEntry {
+    pub auditor: Pubkey,
+    pub added_slot: u64,
+    pub removed_slot: u64,
+}
+
+/// The auditors a cycle's auditor is drawn from (kept by register_auditor and revoke_auditor). A cycle draws only among
+/// the entries that counted when its ledger was committed, before the randomness existed, so changing the registry
+/// later cannot steer the draw.
+#[account]
+#[derive(InitSpace)]
+pub struct AuditorRegistry {
+    #[max_len(MAX_AUDITOR_ENTRIES)]
+    pub entries: Vec<AuditorEntry>,
     pub bump: u8,
 }
 
@@ -554,6 +660,9 @@ pub struct PerkPeriod {
     /// The company's ask cap and usage cap, fixed for the period so a later change of terms cannot affect its lots.
     pub max_ask_bps: u16,
     pub usage_cap_bps: u16,
+    /// Rate (USDC, per tokens) at which the volume an account sent is valued for its trader perk, fixed with the budget.
+    pub rate_usdc: u64,
+    pub rate_tokens: u64,
 }
 
 /// Merchant registered by the issuer (perks are redeemed only with a registered merchant's signature).

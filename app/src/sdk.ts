@@ -37,6 +37,7 @@ export const SEEDS = {
   slashingBond: Buffer.from("slashing_bond"),
   feeVault: Buffer.from("fee_vault"),
   auditor: Buffer.from("auditor"),
+  auditorRegistry: Buffer.from("auditor_registry"),
   claim: Buffer.from("claim"),
   issuerEscrow: Buffer.from("issuer_escrow"),
   partner: Buffer.from("partner"),
@@ -103,6 +104,10 @@ export class TorusPdas {
   /** Record in the operator's auditor registry. */
   auditorRecord(auditor: PublicKey): [PublicKey, number] {
     return PublicKey.findProgramAddressSync([SEEDS.auditor, auditor.toBuffer()], this.protocolprogramId);
+  }
+  /** The list a cycle's auditor is drawn from (one account). */
+  auditorRegistry(): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync([SEEDS.auditorRegistry], this.protocolprogramId);
   }
   /** Claim record (audit cycle × leaf index). */
   claim(audit: PublicKey, index: number): [PublicKey, number] {
@@ -212,6 +217,8 @@ export class TorusPdas {
 export const LEAF_TAG = 0x00;
 export const NODE_TAG = 0x01;
 export const ROOT_TAG = 0x02;
+/** Commitment to the operator's seed: H(SEED_COMMIT_TAG || seed) (constants.rs). */
+export const SEED_COMMIT_TAG = 0x10;
 
 /** Node of the Merkle sum tree. */
 export interface SumNode {
@@ -240,6 +247,33 @@ function u64le(v: bigint): Buffer {
   const b = Buffer.alloc(8);
   b.writeBigUInt64LE(v, 0);
   return b;
+}
+
+function u16le(v: number): Buffer {
+  const b = Buffer.alloc(2);
+  b.writeUInt16LE(v, 0);
+  return b;
+}
+
+/** Commitment to the operator's seed for a sample (sampling::seed_commitment). */
+export function seedCommitment(seed: Uint8Array | number[]): number[] {
+  return Array.from(keccak(Buffer.from([SEED_COMMIT_TAG]), Buffer.from(seed as any)));
+}
+
+/**
+ * Position of sample `j` in [0, total) of the ledger's running sum (sampling::sample_position): a leaf is drawn in
+ * proportion to its declared value. `entropy` is AuditCycle.entropy, `total` its control total.
+ */
+export function samplePosition(entropy: Uint8Array | number[], j: number, total: bigint): bigint {
+  if (total <= 0n) throw new Error("samplePosition: a zero total has nothing to sample");
+  // Draws at or above the largest multiple of the total are discarded (no modulo bias).
+  const limit = ((1n << 64n) / total) * total;
+  let draw = 0n;
+  for (let attempt = 0; attempt <= 0xff; attempt++) {
+    draw = keccak(Buffer.from(entropy as any), u16le(j), Buffer.from([attempt])).readBigUInt64LE(0);
+    if (draw < limit) break;
+  }
+  return draw % total;
 }
 
 export function sumLeaf(index: number, outcomeId: Buffer, beneficiary: PublicKey, value: bigint): SumNode {
@@ -317,6 +351,21 @@ export class SumTree {
 
   valueAt(index: number): bigint {
     return this.values[index];
+  }
+
+  /** Index of the leaf that covers `position` of the running sum (the leaf a sample at that position lands on). */
+  leafAt(position: bigint): number {
+    let lower = 0n;
+    for (let i = 0; i < this.values.length; i++) {
+      if (position >= lower && position - lower < this.values[i]) return i;
+      lower += this.values[i];
+    }
+    throw new Error(`SumTree: position ${position} is outside the total ${this.total}`);
+  }
+
+  /** Leaves to disclose for a cycle's sample, in sample order (repeats allowed): one per sampled position. */
+  sampledLeaves(entropy: Uint8Array | number[], sampleSize: number): number[] {
+    return [...Array(sampleSize).keys()].map((j) => this.leafAt(samplePosition(entropy, j, this.total)));
   }
 
   beneficiaryAt(index: number): PublicKey {
@@ -405,6 +454,7 @@ export class TorusClient {
     treasury: PublicKey, // operator treasury (USDC)
     minSampleSize: number,
     minBondTarget: BN, // minimum bond target (set by the operator)
+    revealGraceSlots: BN, // slots the operator has to reveal its seed before anyone continues without it
     taxHoldPeriod: BN, // seconds a cycle waits for the tax accountant's reconciled report
   ) {
     const [config] = this.pdas.config();
@@ -416,6 +466,7 @@ export class TorusClient {
         treasury,
         minSampleSize,
         minBondTarget,
+        revealGraceSlots,
         taxHoldPeriod,
       )
       .accounts({
@@ -428,7 +479,10 @@ export class TorusClient {
       .instruction();
   }
 
-  /** Adds an independent auditor to the operator's registry (Config.authority only). */
+  /**
+   * Adds an independent auditor to the operator's registry (Config.authority only). It counts for the draw of cycles
+   * committed afterwards. A revoked auditor cannot be registered again.
+   */
   async registerAuditor(authority: PublicKey, auditor: PublicKey) {
     return this.program.methods
       .registerAuditor()
@@ -437,13 +491,19 @@ export class TorusClient {
         config: this.pdas.config()[0],
         auditor,
         auditorRecord: this.pdas.auditorRecord(auditor)[0],
+        auditorRegistry: this.pdas.auditorRegistry()[0],
         systemProgram: web3.SystemProgram.programId,
       })
       .instruction();
   }
 
+  /**
+   * The company's local partner registers the mint it issued (it is the mint authority and signs); `company` is
+   * named as the obligor, which fixes the promise and commits the ledgers.
+   */
   async issueToken(params: {
-    issuer: PublicKey;
+    partner: PublicKey; // the local partner: mint authority, payer, signer
+    company: PublicKey; // the obligor (accepts by signing its manifest)
     mint: PublicKey; // Token-2022 mint (already created, with extensions)
     usdcMint: PublicKey;
     token2022Program: PublicKey; // brand token program (Token-2022)
@@ -460,7 +520,9 @@ export class TorusClient {
     return this.program.methods
       .issueToken(params.transferFeeBps, params.maxFee)
       .accounts({
-        issuer: params.issuer,
+        partner: params.partner,
+        localPartnerRecord: this.pdas.localPartner(params.partner)[0],
+        company: params.company,
         config,
         mint: params.mint,
         usdcMint: params.usdcMint,
@@ -565,35 +627,88 @@ export class TorusClient {
       .instruction();
   }
 
-  async designateSample(params: {
-    crank: PublicKey;
-    mint: PublicKey;
-    periodId: number | bigint | BN;
-    entropy: number[]; // 32 bytes (from a VRF proof in production); the sample size is fixed by the manifest
-  }) {
-    const [audit] = this.pdas.audit(params.mint, params.periodId);
+  /** The operator posts the commitment to its seed for the token's next sample (before any period closes). */
+  async setAuditSeed(params: { authority: PublicKey; mint: PublicKey; seedCommit: number[] }) {
     return this.program.methods
-      .designateSample(params.entropy)
-      .accounts({ crank: params.crank, config: this.pdas.config()[0], audit })
+      .setAuditSeed(params.seedCommit)
+      .accounts({
+        authority: params.authority,
+        config: this.pdas.config()[0],
+        tokenState: this.pdas.tokenState(params.mint)[0],
+      })
       .instruction();
   }
 
   /**
-   * Verifies a disclosure proof: one call per sampled leaf, **in `audit.sample_indices` order**
-   * (cursor). record_verification / finalize_audit fail until all sample_size proofs are in.
+   * Records the hash of the slot fixed at commit (anyone). Fails with EntropyNotAfterCommit until that slot has been
+   * produced. If its hash can no longer be read, a later slot is fixed and the sample is doubled: call it again.
+   */
+  async captureEntropy(params: { crank: PublicKey; mint: PublicKey; periodId: number | bigint | BN }) {
+    const [audit] = this.pdas.audit(params.mint, params.periodId);
+    return this.program.methods
+      .captureEntropy()
+      .accounts({ crank: params.crank, audit, slotHashes: web3.SYSVAR_SLOT_HASHES_PUBKEY })
+      .instruction();
+  }
+
+  /**
+   * The operator reveals the seed it committed to before the ledger was committed, which fixes the sample, and
+   * posts the commitment for the next cycle's seed.
+   */
+  async designateSample(params: {
+    crank: PublicKey; // the operator
+    mint: PublicKey;
+    periodId: number | bigint | BN;
+    seed: number[]; // 32 bytes; its commitment was snapshotted into the cycle at commit
+    nextSeedCommit: number[]; // seedCommitment(next seed)
+  }) {
+    const [audit] = this.pdas.audit(params.mint, params.periodId);
+    return this.program.methods
+      .designateSample(params.seed, params.nextSeedCommit)
+      .accounts({
+        crank: params.crank,
+        config: this.pdas.config()[0],
+        audit,
+        tokenState: this.pdas.tokenState(params.mint)[0],
+        auditorRegistry: this.pdas.auditorRegistry()[0],
+      })
+      .instruction();
+  }
+
+  /** Fixes the sample without the operator's seed once its reveal grace has passed (anyone; the sample doubles). */
+  async designateWithoutSeed(params: { crank: PublicKey; mint: PublicKey; periodId: number | bigint | BN }) {
+    const [audit] = this.pdas.audit(params.mint, params.periodId);
+    return this.program.methods
+      .designateWithoutSeed()
+      .accounts({
+        crank: params.crank,
+        config: this.pdas.config()[0],
+        audit,
+        tokenState: this.pdas.tokenState(params.mint)[0],
+        auditorRegistry: this.pdas.auditorRegistry()[0],
+      })
+      .instruction();
+  }
+
+  /**
+   * Verifies a disclosure proof: one call per sample, in sample order (cursor). The leaf must be the one the sample
+   * landed on (`SumTree.sampledLeaves(audit.entropy, audit.sample_size)`). record_verification / finalize_audit fail
+   * until all sample_size proofs are in.
    */
   async verifyDisclosure(params: {
     crank: PublicKey;
     mint: PublicKey;
     periodId: number | bigint | BN;
+    index: number;
     outcomeId: number[];
     beneficiary: PublicKey;
     value: BN;
     siblings: SumSiblingArg[];
   }) {
     const [audit] = this.pdas.audit(params.mint, params.periodId);
+    const leaf = { index: params.index, outcomeId: params.outcomeId, beneficiary: params.beneficiary, value: params.value };
     return this.program.methods
-      .verifyDisclosure(params.outcomeId, params.beneficiary, params.value, params.siblings)
+      .verifyDisclosure(leaf, params.siblings)
       .accounts({ crank: params.crank, audit })
       .instruction();
   }
@@ -613,6 +728,25 @@ export class TorusClient {
     const current: any = await (this.program.account as any).auditCycle.fetch(audit);
     return this.program.methods
       .recordVerification(params.observedValues, params.reportHash)
+      .accounts({ auditor: params.auditor, audit, auditorRecord: this.pdas.auditorRecord(current.auditor)[0] })
+      .instruction();
+  }
+
+  /**
+   * The cycle's auditor excuses a share (bps) of the judged obligation for a cause the chain cannot see, with the hash
+   * of its reasons (0 withdraws an excuse). Before finalization only; cleared if the auditor is replaced.
+   */
+  async excuseShortfall(params: {
+    auditor: PublicKey;
+    mint: PublicKey;
+    periodId: number | bigint | BN;
+    excusedBps: number;
+    reasonHash: number[]; // 32 bytes
+  }) {
+    const [audit] = this.pdas.audit(params.mint, params.periodId);
+    const current: any = await (this.program.account as any).auditCycle.fetch(audit);
+    return this.program.methods
+      .excuseShortfall(params.excusedBps, params.reasonHash)
       .accounts({ auditor: params.auditor, audit, auditorRecord: this.pdas.auditorRecord(current.auditor)[0] })
       .instruction();
   }
@@ -757,8 +891,9 @@ export class TorusClient {
   }
 
   /**
-   * Terms the operator sets per company (Config.authority only): bond target, minimum conversion price, the issuer's
-   * share for ranks 0..3 (bps, never lower for a higher rank) and the local partner (registered and active).
+   * Terms the operator sets per company: bond target, minimum conversion price, the issuer's share for ranks 0..3
+   * (bps, never lower for a higher rank) and the local partner (registered and active). **The local partner signs
+   * too** (it takes the company on under its own license), and the hash of the terms it accepted is recorded.
    */
   async setIssuerTerms(params: {
     authority: PublicKey;
@@ -766,14 +901,16 @@ export class TorusClient {
     bondTarget: BN;
     minConversionPrice: BN;
     tierShareBps: number[];
-    localPartner: PublicKey;
+    localPartner: PublicKey; // must sign the transaction
+    partnerTermsHash: number[]; // 32 bytes, non-zero (the document is kept off-chain)
   }) {
     return this.program.methods
-      .setIssuerTerms(params.bondTarget, params.minConversionPrice, params.tierShareBps)
+      .setIssuerTerms(params.bondTarget, params.minConversionPrice, params.tierShareBps, params.partnerTermsHash)
       .accounts({
         authority: params.authority,
         config: this.pdas.config()[0],
         tokenState: this.pdas.tokenState(params.mint)[0],
+        localPartner: params.localPartner,
         localPartnerRecord: this.pdas.localPartner(params.localPartner)[0],
       })
       .instruction();
@@ -865,8 +1002,8 @@ export class TorusClient {
   }
 
   /**
-   * Replaces the auditor with another registered auditor (Config.authority only): when it did not record by the
-   * deadline (current cycle), or when it was revoked (no wait; on a finalized cycle only leaf confirmations move).
+   * Replaces the auditor (Config.authority only): when it did not record by the deadline (current cycle), or when it
+   * was revoked (no wait; on a finalized cycle only leaf confirmations move). The new auditor is drawn by the program.
    */
   async replaceAuditor(params: {
     authority: PublicKey;
@@ -874,7 +1011,6 @@ export class TorusClient {
     periodId: number | bigint | BN;
     /** The current auditor (audit.auditor). */
     currentAuditor: PublicKey;
-    newAuditor: PublicKey;
   }) {
     return this.program.methods
       .replaceAuditor()
@@ -885,8 +1021,7 @@ export class TorusClient {
         manifest: this.pdas.manifest(params.mint)[0],
         audit: this.pdas.audit(params.mint, params.periodId)[0],
         currentAuditorRecord: this.pdas.auditorRecord(params.currentAuditor)[0],
-        newAuditor: params.newAuditor,
-        newAuditorRecord: this.pdas.auditorRecord(params.newAuditor)[0],
+        auditorRegistry: this.pdas.auditorRegistry()[0],
       })
       .instruction();
   }
@@ -895,7 +1030,13 @@ export class TorusClient {
   async revokeAuditor(authority: PublicKey, auditor: PublicKey) {
     return this.program.methods
       .revokeAuditor()
-      .accounts({ authority, config: this.pdas.config()[0], auditorRecord: this.pdas.auditorRecord(auditor)[0] })
+      .accounts({
+        authority,
+        config: this.pdas.config()[0],
+        auditorRecord: this.pdas.auditorRecord(auditor)[0],
+        auditorRegistry: this.pdas.auditorRegistry()[0],
+        systemProgram: web3.SystemProgram.programId,
+      })
       .instruction();
   }
 

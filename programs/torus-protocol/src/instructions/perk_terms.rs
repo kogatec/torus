@@ -36,7 +36,7 @@ pub struct SetPerkTerms<'info> {
     pub config: Account<'info, Config>,
 
     #[account(seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()], bump = token_state.bump)]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     #[account(
         init_if_needed,

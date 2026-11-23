@@ -22,7 +22,7 @@ pub enum TorusError {
     #[msg("The manifest's obligation is below the required share of the provisioned budget (under-declaration)")]
     ManifestBelowBudgetFloor,
 
-    #[msg("The entropy was not fixed after the commitment (it could have been chosen afterwards)")]
+    #[msg("The slot whose hash feeds the sample (fixed after the commitment) has not been produced yet")]
     EntropyNotAfterCommit,
 
     #[msg("The entropy failed validation")]
@@ -109,7 +109,7 @@ pub enum TorusError {
     #[msg("The manifest has expired")]
     ManifestExpired,
 
-    #[msg("The caller is not the mint authority (registering someone else's mint is not allowed)")]
+    #[msg("The local partner registering the token is not its mint authority (registering someone else's mint is not allowed)")]
     MintAuthorityNotIssuer,
 
     #[msg("The mint still has a freeze authority (the issuer could freeze the fee vault or holders)")]
@@ -315,6 +315,42 @@ pub enum TorusError {
 
     #[msg("The lot's period has not been closed yet")]
     PerkLotStillOpen,
+
+    #[msg("The operator has not posted a seed commitment for this token's samples yet")]
+    AuditSeedNotSet,
+
+    #[msg("A seed commitment must be non-zero and differ from the one being revealed")]
+    InvalidSeedCommit,
+
+    #[msg("The revealed seed does not match the commitment fixed before the ledger was committed")]
+    SeedMismatch,
+
+    #[msg("The slot hash for this cycle's sample has not been captured yet")]
+    EntropyNotCaptured,
+
+    #[msg("The slot hash for this cycle's sample is already captured")]
+    EntropyAlreadyCaptured,
+
+    #[msg("Until the reveal grace has passed, only the operator's seed can fix the sample")]
+    RevealGraceNotOver,
+
+    #[msg("The reveal grace must be positive")]
+    InvalidRevealGrace,
+
+    #[msg("The disclosed leaf does not cover the sampled position")]
+    SampleNotCovered,
+
+    #[msg("A zero control total has nothing to sample")]
+    NothingToSample,
+
+    #[msg("The SlotHashes sysvar could not be read")]
+    SlotHashesUnreadable,
+
+    #[msg("The auditor registry is full")]
+    AuditorRegistryFull,
+
+    #[msg("This auditor is already registered and active")]
+    AuditorAlreadyRegistered,
     // Kept last, so the codes of the other errors are the same with or without them.
 
     #[msg("The hold period of the tax reconciliation must be positive")]
@@ -334,4 +370,7 @@ pub enum TorusError {
 
     #[msg("The cycle is on hold until the tax accountant files a reconciled report or the hold ends")]
     TaxHoldActive,
+
+    #[msg("An excuse is a share of at most 100% and comes with the hash of its reasons")]
+    InvalidExcuse,
 }

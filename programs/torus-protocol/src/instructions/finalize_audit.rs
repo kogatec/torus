@@ -20,6 +20,7 @@ use anchor_spl::token_interface::{
 
 use crate::constants::*;
 use crate::errors::TorusError;
+use crate::excuses;
 use crate::rules;
 use crate::state::{AuditCycle, Config, Manifest, TokenState};
 use crate::state::{load_if_exists, TaxReport};
@@ -65,10 +66,13 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
 
     // What the obligation recognizes: the control total.
     let recognized = audit.control_total;
+    // When the issuer's own part of the cycle was done (excuses.rs): its commit, and the last report it filed.
+    let last_filed_ts: Option<i64> = None;
 
     // ================= (T) Tax reconciliation: declared total vs. the tax accountant's book total =================
     let now = Clock::get()?.unix_timestamp;
     let report: Option<TaxReport> = load_if_exists(&ctx.accounts.tax_report, &crate::ID)?;
+    let last_filed_ts = report.as_ref().map(|r| r.filed_ts).or(last_filed_ts);
     let tax = tax_rules::tax_verdict(&tax_rules::TaxFacts {
         control_total: audit.control_total,
         tolerance_bps: audit.tolerance_bps,
@@ -109,9 +113,11 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
     // the issuer stands behind. A shortfall is not hidden and not slashed: the gap is carried into the next obligation
     // (TokenState.unfulfilled), so under-reporting never makes an obligation disappear. Within the shortfall
     // tolerance (bps) it is an honest shortfall; beyond it the issuer also drops one tier. The threshold is the commit
-    // snapshot (cannot be loosened after observations are known).
-    let lcl_amount = mul_bps(obligation, audit.shortfall_tolerance_bps)?;
-    let understatement_floor = obligation.saturating_sub(lcl_amount);
+    // snapshot (cannot be loosened after observations are known). The issuer is judged only on the part not excused
+    // (excuses.rs): the period's judged obligation, less what the cycle's auditor excused.
+    let judged = excuses::after_auditor_excuse(audit.judged_obligation, audit.auditor_excused_bps)?;
+    let lcl_amount = mul_bps(judged, audit.shortfall_tolerance_bps)?;
+    let understatement_floor = judged.saturating_sub(lcl_amount);
 
     // ================= Result =================
     // Overstatement (fraud): slash and drop to the base tier at once. Otherwise: obligation met = pass; below it within
@@ -120,7 +126,7 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
     let result = rules::judge(&rules::Findings {
         overstatement: is_overstatement,
         recognized,
-        obligation,
+        obligation: judged,
         floor: understatement_floor,
         tax,
     });
@@ -154,6 +160,9 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
             token_state.tier = 0;
             token_state.consecutive_passes = 0;
             token_state.frozen = true;
+        }
+        AuditResult::Excused => {
+            // Nothing was judged (excuses.rs): the tier and the streak stay as they were.
         }
         AuditResult::Pending => return err!(TorusError::InvalidAuditStage),
     }
@@ -237,9 +246,15 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
         audit.recognized_total = recognized;
         let gap = obligation - audit.reserved_remaining;
         token_state.reserved = token_state.reserved.saturating_sub(gap);
+        // What the issuer was judged on and missed is judged again next period; the excused rest is only carried.
+        let (judged_gap, excused_gap) = excuses::split_carry(gap, judged, recognized);
         token_state.unfulfilled = token_state
             .unfulfilled
-            .checked_add(gap)
+            .checked_add(judged_gap)
+            .ok_or(TorusError::MathOverflow)?;
+        token_state.excused_carry = token_state
+            .excused_carry
+            .checked_add(excused_gap)
             .ok_or(TorusError::MathOverflow)?;
         // Issuer share: what waited for this audit is released (it stays in the escrow).
         token_state.issuer_claimable = token_state
@@ -251,14 +266,20 @@ pub fn handler(ctx: Context<FinalizeAudit>) -> Result<()> {
         token_state.last_good_period = audit.period_id;
     }
 
+    // Whether the issuer did its own part of this cycle on time: the next provision excuses a lost window only then.
+    let steps = excuses::steps_of(token_state, audit, last_filed_ts)?;
+    audit.issuer_on_time = excuses::issuer_on_time(&steps, token_state.grid_period_len);
+
     audit.result = result as u8;
     audit.stage = AuditStage::Finalized as u8;
 
     msg!("finalize_audit: tax={:?}", tax);
     msg!(
-        "finalize_audit: result={:?} obligation={} control_total={} recognized={} residual={} defects={}/{} tier->{}",
+        "finalize_audit: result={:?} obligation={} judged={} on_time={} control_total={} recognized={} residual={} defects={}/{} tier->{}",
         result,
         obligation,
+        judged,
+        audit.issuer_on_time,
         audit.control_total,
         recognized,
         residual,
@@ -292,7 +313,7 @@ pub struct FinalizeAudit<'info> {
         seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()],
         bump = token_state.bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     #[account(
         seeds = [MANIFEST_SEED, token_state.mint.as_ref()],

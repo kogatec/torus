@@ -2,8 +2,9 @@
 //!
 //! Registers the USDC mint (currency of the redemption pool and the bond, so the backing is not the brand
 //! token) and the transfer hook program id (burned into each mint's TransferHook at issuance). It also fixes
-//! where slashed bonds go, the treasury that receives the operator's share of converted fees, and the
-//! minimum bond target (min_bond_target); each company's bond target must be at least this.
+//! where slashed bonds go, the treasury that receives the operator's share of converted fees, the
+//! minimum bond target (min_bond_target; each company's bond target must be at least this) and how long the operator
+//! has to reveal its seed for a sample (reveal_grace_slots; afterwards anyone continues the audit without it).
 //! The hold period of the tax reconciliation (tax_hold_period) is fixed here too, so no company can change it.
 
 use anchor_lang::prelude::*;
@@ -21,12 +22,14 @@ pub fn handler(
     treasury: Pubkey,
     min_sample_size: u16,
     min_bond_target: u64,
+    reveal_grace_slots: u64,
     tax_hold_period: i64,
 ) -> Result<()> {
     require!(
         min_sample_size > 0 && (min_sample_size as usize) <= MAX_SAMPLE_SIZE,
         TorusError::InvalidSampleSize
     );
+    require!(reveal_grace_slots > 0, TorusError::InvalidRevealGrace);
     require!(tax_hold_period > 0, TorusError::InvalidHoldPeriod);
     let config = &mut ctx.accounts.config;
     config.authority = ctx.accounts.authority.key();
@@ -37,6 +40,7 @@ pub fn handler(
     config.min_sample_size = min_sample_size;
     config.treasury = treasury;
     config.min_bond_target = min_bond_target;
+    config.reveal_grace_slots = reveal_grace_slots;
     config.tax_hold_period = tax_hold_period;
 
     msg!(

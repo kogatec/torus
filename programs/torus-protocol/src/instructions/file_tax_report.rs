@@ -52,7 +52,7 @@ pub struct FileTaxReport<'info> {
     pub accountant: Signer<'info>,
 
     #[account(seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()], bump = token_state.bump)]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     #[account(
         seeds = [TAX_ACCOUNTANT_SEED, token_state.mint.as_ref()],

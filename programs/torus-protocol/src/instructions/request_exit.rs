@@ -47,5 +47,5 @@ pub struct RequestExit<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 }

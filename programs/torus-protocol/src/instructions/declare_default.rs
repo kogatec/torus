@@ -4,8 +4,10 @@
 //! skipped. But if the issuer **simply never commits**, the audit itself stalls (and if stalling had no
 //! penalty, walking away from the obligation would pay).
 //!
-//! So once the deadline set at provisioning (TokenState.audit_deadline) has passed and something the issuer must
-//! supply is missing (the commitment, the sampled disclosures, or the uniqueness proof), anyone can declare a default.
+//! So once the audit deadline (TokenState.audit_deadline) has passed and something the issuer must supply is missing
+//! (the commitment, the sampled disclosures, or the uniqueness proof), anyone can declare a default. The deadline never
+//! cuts the issuer short: it is one period after the provisioned period's window ends, whoever cranked the provision
+//! and when, and it leaves at least one period after the sample is drawn (deadlines.rs).
 //! A default is treated as the extreme case of understatement (attack Y): like fraud in finalize_audit, the token
 //! drops to the base tier, is frozen, and the whole bond and issuer escrow are slashed.
 //!
@@ -131,14 +133,14 @@ pub struct DeclareDefault<'info> {
     pub crank: Signer<'info>,
 
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 
     #[account(
         mut,
         seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()],
         bump = token_state.bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// Audit cycle PDA of the current period (token_state.period_id). Does not exist if nothing was committed.
     /// CHECK: address bound by seeds; if it exists, the handler checks the owner before reading it.
@@ -162,24 +164,24 @@ pub struct DeclareDefault<'info> {
         mut,
         address = token_state.slashing_bond @ TorusError::Unauthorized,
     )]
-    pub slashing_bond: InterfaceAccount<'info, TokenAccount>,
+    pub slashing_bond: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Issuer escrow (USDC). Slashed on default.
     #[account(
         mut,
         address = token_state.issuer_escrow @ TorusError::Unauthorized,
     )]
-    pub issuer_escrow: InterfaceAccount<'info, TokenAccount>,
+    pub issuer_escrow: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Slash destination: the compensation pool fixed in Config (USDC). The caller cannot change it.
     #[account(
         mut,
         address = config.slash_destination @ TorusError::Unauthorized,
     )]
-    pub slash_destination: InterfaceAccount<'info, TokenAccount>,
+    pub slash_destination: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(address = token_state.usdc_mint @ TorusError::NonUsdcCollateral)]
-    pub usdc_mint: InterfaceAccount<'info, Mint>,
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
 
     pub token_program: Interface<'info, TokenInterface>,
 }

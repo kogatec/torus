@@ -62,7 +62,7 @@ pub struct SetEscrowPartner<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// The manifest (its auditor must differ from the partner; its term decides whether a campaign is running).
     #[account(

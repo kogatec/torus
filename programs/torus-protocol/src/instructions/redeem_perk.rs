@@ -34,7 +34,8 @@ pub fn handler(ctx: Context<RedeemPerk>, kind: u8, amount: u64, receipt_id: [u8;
     let discount = match kind {
         PERK_TRADER => {
             let last = period.checked_sub(1).ok_or(TorusError::PerkPeriodNotCurrent)?;
-            let allowance = mul_bps(record.sent.in_period(last), pp.trader_rate_bps)?;
+            let sent = rules::value_at(record.sent.in_period(last), (pp.rate_usdc, pp.rate_tokens))?;
+            let allowance = mul_bps(sent, pp.trader_rate_bps)?;
             hp.trader_used = rules::within(hp.trader_used, amount, allowance, TorusError::PerkAllowanceExceeded)?;
             pp.trader_used = rules::within(pp.trader_used, amount, pp.trader_budget, TorusError::PerkBudgetExceeded)?;
             amount

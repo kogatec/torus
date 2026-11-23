@@ -35,7 +35,7 @@ pub struct RegisterMerchant<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// The merchant to register.
     /// CHECK: only the key is recorded; no signature needed.
@@ -63,7 +63,7 @@ pub struct RevokeMerchant<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     #[account(
         mut,

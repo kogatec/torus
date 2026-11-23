@@ -10,25 +10,28 @@
 use anchor_lang::prelude::*;
 
 pub mod constants;
+pub mod deadlines;
 pub mod errors;
+pub mod excuses;
 pub mod state;
 pub mod instructions;
 pub mod rules;
+pub mod sampling;
 pub mod tax_rules;
 
 use constants::TIERS;
 use instructions::*;
 use state::PerkParams;
 
-declare_id!("6n1Nme9H1aUoXY2P2RaHBVWKAHHyEVPjx9n8WdU8oGdR");
+declare_id!("FL22UpMorhRRh8aXH8NRRR82PG2mQoBeoekqcTrC7nc3");
 
 #[program]
 pub mod torus_protocol {
     use super::*;
 
     /// Initializes the protocol: USDC mint, transfer hook program id, the compensation pool that receives
-    /// slashed bonds, the operator treasury, the minimum sample size and the minimum bond target. Only the program's
-    /// upgrade authority can call it.
+    /// slashed bonds, the operator treasury, the minimum sample size, the minimum bond target and the grace the
+    /// operator has to reveal its seed for a sample. Only the program's upgrade authority can call it.
     /// It also fixes the hold period of the tax reconciliation.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize(
@@ -39,6 +42,7 @@ pub mod torus_protocol {
         treasury: Pubkey,
         min_sample_size: u16,
         min_bond_target: u64,
+        reveal_grace_slots: u64,
         tax_hold_period: i64,
     ) -> Result<()> {
         instructions::initialize::handler(
@@ -49,12 +53,14 @@ pub mod torus_protocol {
             treasury,
             min_sample_size,
             min_bond_target,
+            reveal_grace_slots,
             tax_hold_period,
         )
     }
 
-    /// Registers a Token-2022 mint with the TransferFee and TransferHook extensions after checking that no
-    /// issuer key can change the rules, and creates its TokenState and USDC accounts (redemption pool,
+    /// The company's local partner registers the Token-2022 mint it issued (TransferFee and TransferHook extensions)
+    /// for the company named as the obligor, after checking that no key can change the rules, and creates its
+    /// TokenState and USDC accounts (redemption pool,
     /// slashing bond, issuer escrow, fee vault). The bond target is set by the operator (set_issuer_terms).
     /// The mint authority moves to the program: afterwards only restamp mints, never more than it burns.
     pub fn issue_token(
@@ -66,14 +72,28 @@ pub mod torus_protocol {
     }
 
     /// Terms the operator sets per company: the bond target, the minimum price for converting fees, the issuer's
-    /// share per rank and the local partner (Config.authority only).
+    /// share per rank and the local partner. Signed by the operator and by that local partner, which takes the
+    /// company on under its own license; the hash of the terms it accepted is recorded.
     pub fn set_issuer_terms(
         ctx: Context<SetIssuerTerms>,
         bond_target: u64,
         min_conversion_price: u64,
         tier_share_bps: [u16; TIERS],
+        partner_terms_hash: [u8; 32],
     ) -> Result<()> {
-        instructions::set_issuer_terms::handler(ctx, bond_target, min_conversion_price, tier_share_bps)
+        instructions::set_issuer_terms::handler(
+            ctx,
+            bond_target,
+            min_conversion_price,
+            tier_share_bps,
+            partner_terms_hash,
+        )
+    }
+
+    /// The operator posts the commitment to its seed for the token's next sample. No period closes before the first
+    /// one is posted; afterwards each reveal posts the next (Config.authority only).
+    pub fn set_audit_seed(ctx: Context<SetAuditSeed>, seed_commit: [u8; 32]) -> Result<()> {
+        instructions::set_audit_seed::handler(ctx, seed_commit)
     }
 
     /// Adds an exchange partner to the operator's registry (Config.authority only).
@@ -150,10 +170,26 @@ pub mod torus_protocol {
         instructions::commit_performance::handler(ctx, commitment_value, control_total, population_size)
     }
 
-    /// Designates the sample from entropy fixed after the commitment (to be replaced by a VRF; for now only
-    /// the post-commit ordering is enforced).
-    pub fn designate_sample(ctx: Context<DesignateSample>, entropy: [u8; 32]) -> Result<()> {
-        instructions::designate_sample::handler(ctx, entropy)
+    /// Records the hash of the slot fixed at commit, read from the SlotHashes sysvar (anyone). If that hash can no
+    /// longer be read, a later slot is fixed and the sample is doubled.
+    pub fn capture_entropy(ctx: Context<CaptureEntropy>) -> Result<()> {
+        instructions::capture_entropy::handler(ctx)
+    }
+
+    /// The operator reveals the seed it committed to before the ledger was committed; mixed with the captured slot
+    /// hash it fixes the sample (positions of the ledger's running sum: leaves are drawn in proportion to value).
+    /// The commitment for the next cycle's seed is posted in the same call.
+    pub fn designate_sample(
+        ctx: Context<DesignateSample>,
+        seed: [u8; 32],
+        next_seed_commit: [u8; 32],
+    ) -> Result<()> {
+        instructions::designate_sample::handler(ctx, seed, next_seed_commit)
+    }
+
+    /// Fixes the sample without the operator's seed once its reveal grace has passed (anyone), with a doubled sample.
+    pub fn designate_without_seed(ctx: Context<DesignateWithoutSeed>) -> Result<()> {
+        instructions::designate_sample::handler_without_seed(ctx)
     }
 
     /// The independent auditor records the observed value of each sampled leaf, in sample order (may span
@@ -167,17 +203,26 @@ pub mod torus_protocol {
         instructions::record_verification::handler(ctx, observed_values, report_hash)
     }
 
-    /// Verifies a disclosure proof (sum-bound commitment), one sampled leaf at a time: the proof against the
-    /// commitment and "rebuilt root sum == control total". The claimed value is fixed and summed on-chain, so
-    /// the deviation check is bound to the issuer's prior commitment and the population cannot be thinned.
+    /// The cycle's auditor excuses a share (bps) of the judged obligation for a cause the chain cannot see, with the
+    /// hash of its reasons (0 bps withdraws an excuse). Before finalization only.
+    pub fn excuse_shortfall(
+        ctx: Context<ExcuseShortfall>,
+        excused_bps: u16,
+        reason_hash: [u8; 32],
+    ) -> Result<()> {
+        instructions::excuse_shortfall::handler(ctx, excused_bps, reason_hash)
+    }
+
+    /// Verifies a disclosure proof (sum-bound commitment), one sample at a time: the proof against the commitment,
+    /// "rebuilt root sum == control total", and that the leaf covers the sampled position of the running sum. The
+    /// claimed value is fixed and summed on-chain, so the deviation check is bound to the issuer's prior commitment,
+    /// the population cannot be thinned, and value cannot hide where samples do not land.
     pub fn verify_disclosure(
         ctx: Context<VerifyDisclosure>,
-        outcome_id: [u8; 32],
-        beneficiary: Pubkey,
-        value: u64,
+        leaf: DisclosedLeaf,
         siblings: Vec<SumSibling>,
     ) -> Result<()> {
-        instructions::verify_disclosure::handler(ctx, outcome_id, beneficiary, value, siblings)
+        instructions::verify_disclosure::handler(ctx, leaf, siblings)
     }
 
     /// Verifies uniqueness: receives all leaves in index order, checks payment IDs are strictly increasing and

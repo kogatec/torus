@@ -121,7 +121,7 @@ pub struct HarvestFees<'info> {
         seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()],
         bump = token_state.bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// The brand token's Token-2022 mint (with TransferFee).
     /// mut because harvesting writes the withheld amount to it.

@@ -43,6 +43,16 @@ pub const SLASHING_BOND_SEED: &[u8] = b"slashing_bond";
 pub const FEE_VAULT_SEED: &[u8] = b"fee_vault";
 /// Registry of independent auditors (kept by the operator, so the issuer cannot name an arbitrary key).
 pub const AUDITOR_SEED: &[u8] = b"auditor";
+/// The registry of auditors that a cycle's auditor is drawn from (one account).
+pub const AUDITOR_REGISTRY_SEED: &[u8] = b"auditor_registry";
+/// Most entries in the auditor registry (one per auditor ever registered: a revocation is permanent and its entry stays,
+/// so a past commit keeps the set it was drawn from).
+pub const MAX_AUDITOR_ENTRIES: usize = 128;
+/// A replacement when every auditor counted at the commit was revoked: only auditors listed at least this long ago
+/// (about two days of slots) are drawn, so one added for the occasion is not.
+pub const AUDITOR_FALLBACK_AGE_SLOTS: u64 = 432_000;
+/// removed_slot of an entry that has not been revoked.
+pub const AUDITOR_NOT_REMOVED: u64 = u64::MAX;
 /// Claim record (one per audit cycle × leaf index; prevents double claims).
 pub const CLAIM_SEED: &[u8] = b"claim";
 /// USDC account (PDA-owned) holding the issuer's share until the audit finalizes.
@@ -104,6 +114,20 @@ pub const BOND_USE_MAX_BPS: u64 = 5_000;
 /// Maximum depth of a disclosure proof (Merkle sum tree). Supports up to 2^32 elements.
 pub const MAX_PROOF_DEPTH: usize = 32;
 
+/// Slots from the commitment to the slot whose hash feeds the sample. That slot does not exist yet when the ledger
+/// is committed, so its hash is unknown to everyone at that point.
+pub const ENTROPY_DELAY_SLOTS: u64 = 2;
+
+// ---- Domain-separation tags of the sample's randomness (sampling.rs) ----
+/// Commitment to the operator's seed: H(SEED_COMMIT_TAG || seed)
+pub const SEED_COMMIT_TAG: u8 = 0x10;
+/// Entropy when the operator revealed its seed: H(ENTROPY_SEEDED_TAG || seed || slot_hash || audit)
+pub const ENTROPY_SEEDED_TAG: u8 = 0x11;
+/// Entropy when nobody revealed the seed in time: H(ENTROPY_UNSEEDED_TAG || seed commitment || slot_hash || audit)
+pub const ENTROPY_UNSEEDED_TAG: u8 = 0x12;
+/// Draw of a cycle's auditor: H(AUDITOR_DRAW_TAG || entropy || previous auditor)
+pub const AUDITOR_DRAW_TAG: u8 = 0x13;
+
 /// Downside tolerance (bps) of the fee cross-check: 30%.
 /// Collected fees can lag the expected fees (per-transfer fee cap, accounts not harvested yet), so only a
 /// shortfall up to this band is tolerated. Collecting more than expected is never tolerated.
@@ -148,4 +172,7 @@ pub enum AuditResult {
     /// The declared total exceeded the tax accountant's book total and no reconciled report came within the hold.
     /// Forfeited like fraud.
     BookMismatch = 6,
+    /// Nothing was left to judge: the period's whole judged obligation was excused (excuses.rs). Neither a pass nor a
+    /// shortfall: the tier and the streak stay, the obligation is carried, and delivered leaves are paid as usual.
+    Excused = 7,
 }

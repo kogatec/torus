@@ -76,12 +76,13 @@ pub fn handler(
         TorusError::InvalidAuditStage
     );
 
-    // --- (2) No fraud (Pass or honest shortfall only) ---
+    // --- (2) No fraud (Pass, honest shortfall, or an excused period whose deliveries are paid as usual) ---
     // Pending / FraudOverstatement / FraudUnderstatement (default) cannot be paid.
     require!(
         audit.result == AuditResult::Pass as u8
             || audit.result == AuditResult::HonestShortfall as u8
-            || audit.result == AuditResult::Underdelivered as u8,
+            || audit.result == AuditResult::Underdelivered as u8
+            || audit.result == AuditResult::Excused as u8,
         TorusError::Unauthorized
     );
 
@@ -96,10 +97,10 @@ pub fn handler(
     // --- (5) The leaf is in the committed ledger and the destination is owned by its recipient ---
     require!(index < audit.population_size, TorusError::ClaimProofInvalid);
     let beneficiary = ctx.accounts.beneficiary_usdc.owner;
-    let (root_commitment, root_sum) =
+    let proof =
         fold_sum_proof(index, &outcome_id, &beneficiary, value, &siblings, audit.population_size)?;
     require!(
-        root_commitment == audit.commitment_value && root_sum == audit.control_total,
+        proof.commitment == audit.commitment_value && proof.root_sum == audit.control_total,
         TorusError::ClaimProofInvalid
     );
 

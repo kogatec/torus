@@ -11,7 +11,10 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::TokenAccount;
 
 use crate::constants::*;
+use crate::deadlines;
 use crate::errors::TorusError;
+use crate::excuses;
+use crate::rules;
 use crate::state::{AuditCycle, Config, Manifest, TokenState};
 
 /// Byte offset of total (u64) in VolumeCounter.
@@ -36,6 +39,12 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     require!(!ctx.accounts.token_state.exited, TorusError::TokenExited);
     // No redemptions until the bond reaches its target (no metering of obligations, nothing shown to users).
     require!(ctx.accounts.token_state.redemption_started, TorusError::BondTargetNotReached);
+    // The seed commitment for the first sample must be posted before any obligation exists: an issuer is never
+    // left with an audit it cannot start (the commitment is snapshotted when it commits its ledger).
+    require!(
+        ctx.accounts.token_state.audit_seed_commit != [0u8; 32],
+        TorusError::AuditSeedNotSet
+    );
 
     let now = Clock::get()?.unix_timestamp;
 
@@ -56,6 +65,8 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
         ts.grid_period_len = period_len;
         ts.period_start_ts = now;
         ts.last_settled_harvested = ts.cumulative_harvested;
+        // Conversions made while the bond was filling set the rate of record; the first metered period starts empty.
+        ts.roll_conversion_rate();
         ts.periods_started = true;
         msg!(
             "provision_budget: mint={} periods_started counter_total={}",
@@ -88,6 +99,8 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     // (no volume) has nothing to audit and no audit cycle; requiring finalization there would freeze the token
     // forever after a single period without volume.
     let current_period = ctx.accounts.token_state.period_id;
+    // What the previous cycle tells about a late provision (excuses.rs); no previous cycle, no excuse.
+    let mut previous = excuses::PreviousCycle::default();
     if current_period > 0 && ctx.accounts.token_state.budget > 0 {
         let prev = ctx
             .accounts
@@ -104,6 +117,11 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
             prev.stage == AuditStage::Finalized as u8,
             TorusError::PreviousAuditNotFinalized
         );
+        previous = excuses::PreviousCycle {
+            on_time: prev.issuer_on_time,
+            held_up: prev.held_up,
+            excused: prev.result == AuditResult::Excused as u8,
+        };
     }
 
     // Read the hook's cumulative volume and cumulative expected fee (both monotonic).
@@ -126,8 +144,10 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     token_state.current_period_activity = end_total; // cumulative at the start of the next period.
     token_state.period_id = k.checked_add(1).ok_or(TorusError::MathOverflow)?;
     token_state.period_start_ts = period_end; // start of the next period (fixed boundary).
-    // Audit deadline: if the commitment and disclosures are not complete by then, a default can be declared.
-    token_state.audit_deadline = now.checked_add(period_len).ok_or(TorusError::MathOverflow)?;
+    // Audit deadline: if the commitment and disclosures are not complete by then, a default can be declared. It follows
+    // the provisioned period's window (one period after it ends), so whoever cranks this, and however early, cannot cut
+    // the issuer's time to commit what it delivered in that window.
+    token_state.audit_deadline = deadlines::after_provision(now, period_end, period_len)?;
 
     // ===== Fee cross-check: fees implied by transfers vs. fees collected =====
     // fee_total is accumulated by the hook **per transfer**, computed from the mint's fee config (including max_fee)
@@ -155,18 +175,26 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     }
     token_state.last_settled_harvested = token_state.cumulative_harvested;
 
-    // Budget = activity of the closed period × the return rate of its terms, plus what earlier cycles fell short of
-    // (carried, so an honest shortfall is delivered later instead of disappearing).
+    // Budget = activity of the closed period × the return rate of its terms, **valued in the pool's currency at the
+    // rate the period's fees were converted at** (volume is metered in brand tokens, the pool holds USDC), plus what
+    // earlier cycles fell short of (carried, so an honest shortfall is delivered later instead of disappearing).
+    let rate = token_state.valuation_rate()?;
+    token_state.roll_conversion_rate();
     // A period that started between campaigns gets no new obligation (its volume is not counted) and the carry waits,
     // except in the exit's last period, whose final audit settles the carry.
     let settles_carry = in_campaign
         || (token_state.exit_requested && k == token_state.exit_request_period);
+    // Both carries are owed: what earlier cycles fell short of, and what was excused (excuses.rs).
+    let carried = token_state
+        .unfulfilled
+        .checked_add(token_state.excused_carry)
+        .ok_or(TorusError::MathOverflow)?;
     let budget = if in_campaign {
-        mul_bps(delta, terms.return_rate_bps)?
-            .checked_add(token_state.unfulfilled)
+        rules::value_at(mul_bps(delta, terms.return_rate_bps)?, rate)?
+            .checked_add(carried)
             .ok_or(TorusError::MathOverflow)?
     } else if settles_carry {
-        token_state.unfulfilled
+        carried
     } else {
         0
     };
@@ -179,8 +207,15 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     require!(vault_amount >= required, TorusError::BudgetNotEscrowed);
     token_state.budget = budget;
     token_state.reserved = required;
+    // The part the issuer is judged on (excuses.rs): never the carried excused obligation, and nothing at all when the
+    // provisioned window was over before this provision because someone else held up the previous cycle.
+    let window_over = now >= period_end.checked_add(period_len).ok_or(TorusError::MathOverflow)?;
+    let excused_in_budget = if settles_carry { token_state.excused_carry } else { 0 };
+    token_state.judged_budget = excuses::judged_budget(budget, excused_in_budget, window_over, previous);
+    token_state.provisioned_ts = now;
     if settles_carry {
         token_state.unfulfilled = 0; // now part of this cycle's obligation
+        token_state.excused_carry = 0;
     }
     // The audit of this obligation is judged by the same terms (commit_performance snapshots them from here).
     token_state.cycle_terms = terms;
@@ -193,12 +228,13 @@ pub fn handler(ctx: Context<ProvisionBudget>) -> Result<()> {
     token_state.issuer_accruing = 0;
 
     msg!(
-        "provision_budget: mint={} period_id={} delta={} counter_total={} budget={} audit_deadline={}",
+        "provision_budget: mint={} period_id={} delta={} counter_total={} budget={} judged={} audit_deadline={}",
         token_state.mint,
         token_state.period_id,
         delta,
         counter_total,
         token_state.budget,
+        token_state.judged_budget,
         token_state.audit_deadline
     );
     Ok(())
@@ -272,21 +308,21 @@ pub struct ProvisionBudget<'info> {
     pub crank: Signer<'info>,
 
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
 
     #[account(
         mut,
         seeds = [TOKEN_STATE_SEED, token_state.mint.as_ref()],
         bump = token_state.bump,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     #[account(
         seeds = [MANIFEST_SEED, token_state.mint.as_ref()],
         bump = manifest.bump,
         constraint = manifest.token == token_state.mint @ TorusError::Unauthorized,
     )]
-    pub manifest: Account<'info, Manifest>,
+    pub manifest: Box<Account<'info, Manifest>>,
 
     /// The hook's VolumeCounter (cumulative, monotonic, owned by torus_hook); total and fee_total are read only.
     /// Bound to the legitimate hook-owned PDA by seeds + seeds::program + owner (no fake counter can be injected).
@@ -301,9 +337,9 @@ pub struct ProvisionBudget<'info> {
 
     /// First account (redemption pool); its balance must cover the provisioned budget.
     #[account(address = token_state.redemption_vault @ TorusError::Unauthorized)]
-    pub redemption_vault: InterfaceAccount<'info, TokenAccount>,
+    pub redemption_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// Audit cycle of the period being closed (current period_id). Required (and must be Finalized) if period_id > 0
     /// and its budget > 0. The handler checks the address against the PDA (seeds = [audit, mint, period_id]).
-    pub prev_audit: Option<Account<'info, AuditCycle>>,
+    pub prev_audit: Option<Box<Account<'info, AuditCycle>>>,
 }

@@ -152,7 +152,7 @@ pub struct SetManifest<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     /// The manifest. init_if_needed so it can be set again
     /// (anchor-lang's "init-if-needed" feature is enabled in Cargo.toml).

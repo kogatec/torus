@@ -27,7 +27,9 @@ pub fn handler(ctx: Context<OpenPerkPeriod>) -> Result<()> {
 
     let counter: VolumeCounter =
         load_if_exists(&ctx.accounts.volume_counter, &torus_hook::ID)?.ok_or(TorusError::Unauthorized)?;
-    let registered_volume = counter.registered.in_period(period - 1);
+    // Volume is metered in brand tokens and the budget is in the pool's currency: value the volume before dividing.
+    let rate = ts.valuation_rate()?;
+    let registered_volume = rules::value_at(counter.registered.in_period(period - 1), rate)?;
     let terms = &ctx.accounts.perk_terms.params;
     let trader_budget = mul_bps(ts.budget, terms.trader_bps)?;
 
@@ -37,6 +39,7 @@ pub fn handler(ctx: Context<OpenPerkPeriod>) -> Result<()> {
     pp.trader_budget = trader_budget;
     pp.hold_budget = mul_bps(ts.budget, terms.hold_bps)?;
     pp.trader_rate_bps = rules::trader_rate_bps(trader_budget, registered_volume, ts.transfer_fee_bps);
+    (pp.rate_usdc, pp.rate_tokens) = rate;
     pp.trader_used = 0;
     pp.hold_used = 0;
     pp.bump = ctx.bumps.perk_period;

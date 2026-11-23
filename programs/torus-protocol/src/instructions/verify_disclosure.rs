@@ -19,10 +19,13 @@
 //! - internal: `H(NODE_TAG ‖ Lh ‖ Ls ‖ Rh ‖ Rs)`, sum = Ls + Rs
 //! - commitment: `H(ROOT_TAG ‖ root_hash ‖ root_sum ‖ population_size)`
 //!
-//! For each sampled leaf this instruction checks the proof: (1) the leaf is in the commitment, and
-//! (2) **the rebuilt root sum equals `control_total`**. Therefore:
+//! For each sample this instruction checks the proof: (1) the leaf is in the commitment, (2) **the rebuilt root sum
+//! equals `control_total`**, and (3) **the leaf covers the sampled position** of the ledger's running sum. Therefore:
 //! - claimed values are **fixed on-chain**, not reported (Δ's input is bound to the prior commitment);
-//! - the control total is **cryptographically bound** to the commitment (thinning leaves the sum short and Y fires).
+//! - the control total is **cryptographically bound** to the commitment (thinning leaves the sum short and Y fires);
+//! - a leaf is drawn **in proportion to its declared value** (sampling.rs). Every internal node binds the sums of
+//!   both children, so the sum of the left siblings on the proof's path is the sum of all leaves before this one:
+//!   the leaf holds exactly that range of the running sum, and no value can sit where a sample cannot land.
 //!
 //! An attacker faces both constraints at once: removing entries leaves the sum short and Y fires; padding the sum
 //! with fabricated entries raises the defect rate and Δ fires. **The only feasible region is actually delivering.**
@@ -33,6 +36,7 @@ use anchor_lang::solana_program::keccak;
 
 use crate::constants::*;
 use crate::errors::TorusError;
+use crate::sampling;
 use crate::state::AuditCycle;
 
 /// Sibling node in a disclosure proof. `is_left = true` means the sibling is on the left.
@@ -43,11 +47,28 @@ pub struct SumSibling {
     pub is_left: bool,
 }
 
+/// The leaf disclosed for a sample.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct DisclosedLeaf {
+    pub index: u32,
+    pub outcome_id: [u8; 32],
+    pub beneficiary: Pubkey,
+    pub value: u64,
+}
+
+/// What a disclosure proof establishes about its leaf.
+pub struct FoldedProof {
+    /// Root commitment rebuilt from the leaf and its siblings.
+    pub commitment: [u8; 32],
+    /// Root sum rebuilt on the way.
+    pub root_sum: u64,
+    /// Sum of all leaves before this one: the leaf holds [lower, lower + value) of the running sum.
+    pub lower: u64,
+}
+
 pub fn handler(
     ctx: Context<VerifyDisclosure>,
-    outcome_id: [u8; 32],
-    beneficiary: Pubkey,
-    value: u64,
+    leaf: DisclosedLeaf,
     siblings: Vec<SumSibling>,
 ) -> Result<()> {
     let audit = &mut ctx.accounts.audit;
@@ -62,25 +83,39 @@ pub fn handler(
         TorusError::DisclosuresAlreadyComplete
     );
 
-    // Leaves are verified in sample_indices order; the fixed order prevents counting one twice.
-    let index = audit.sample_indices[audit.verify_cursor as usize];
+    // Samples are disclosed in order (the cursor is the sample number), so none is counted twice.
+    let position = sampling::sample_position(&audit.entropy, audit.verify_cursor, audit.control_total)?;
 
     // --- The leaf is in the commitment; rebuild the root sum at the same time ---
-    let (root_commitment, root_sum) =
-        fold_sum_proof(index, &outcome_id, &beneficiary, value, &siblings, audit.population_size)?;
+    let proof = fold_sum_proof(
+        leaf.index,
+        &leaf.outcome_id,
+        &leaf.beneficiary,
+        leaf.value,
+        &siblings,
+        audit.population_size,
+    )?;
     require!(
-        root_commitment == audit.commitment_value,
+        proof.commitment == audit.commitment_value,
         TorusError::DisclosureProofInvalid
     );
 
     // --- Sum binding: the total implied by the commitment == the control total ---
     //     This is what deterministically blocks thinning the population (attack Y).
     require!(
-        root_sum == audit.control_total,
+        proof.root_sum == audit.control_total,
         TorusError::ControlTotalMismatch
     );
 
-    // --- Fix and add the claimed value on-chain (nothing reported); keep the per-sample value ---
+    // --- The disclosed leaf is the one the sample landed on (drawn in proportion to its value) ---
+    require!(
+        sampling::covers(proof.lower, leaf.value, position),
+        TorusError::SampleNotCovered
+    );
+
+    // --- Fix and add the claimed value on-chain (nothing reported); keep the per-sample leaf and value ---
+    let (index, beneficiary, value, root_sum) = (leaf.index, leaf.beneficiary, leaf.value, proof.root_sum);
+    audit.sample_indices.push(index);
     audit.sample_values.push(value);
     audit.asserted_sample_sum = audit
         .asserted_sample_sum
@@ -92,7 +127,8 @@ pub fn handler(
         .ok_or(TorusError::MathOverflow)?;
 
     msg!(
-        "verify_disclosure: idx={} beneficiary={} value={} cursor={}/{} root_sum={}",
+        "verify_disclosure: position={} idx={} beneficiary={} value={} cursor={}/{} root_sum={}",
+        position,
         index,
         beneficiary,
         value,
@@ -139,7 +175,7 @@ pub fn root_commitment(root_hash: &[u8; 32], root_sum: u64, population_size: u32
 }
 
 /// Folds the siblings up from the leaf and returns the root commitment
-/// `H(ROOT_TAG ‖ root_hash ‖ root_sum ‖ population_size)` and the root sum.
+/// `H(ROOT_TAG ‖ root_hash ‖ root_sum ‖ population_size)`, the root sum, and the sum of the leaves before this one.
 /// verify_disclosure (sample disclosure) and payout (claims) verify the same leaves with this same function.
 ///
 /// **The tree's shape is bound to the index and the population size**: at each level, whether a sibling exists and
@@ -153,11 +189,12 @@ pub fn fold_sum_proof(
     value: u64,
     siblings: &[SumSibling],
     population_size: u32,
-) -> Result<([u8; 32], u64)> {
+) -> Result<FoldedProof> {
     require!(siblings.len() <= MAX_PROOF_DEPTH, TorusError::ProofTooDeep);
     require!(index < population_size, TorusError::ProofShapeMismatch);
     let mut cur_hash = leaf_hash(index, outcome_id, beneficiary, value);
     let mut cur_sum: u64 = value;
+    let mut lower: u64 = 0;
     let mut idx = index;
     let mut level_len = population_size;
     let mut next_sibling = 0usize;
@@ -174,13 +211,23 @@ pub fn fold_sum_proof(
             cur_sum = cur_sum
                 .checked_add(sib.sum)
                 .ok_or(TorusError::MathOverflow)?;
+            if sib.is_left {
+                // Everything under a left sibling comes before this leaf in the running sum.
+                lower = lower
+                    .checked_add(sib.sum)
+                    .ok_or(TorusError::MathOverflow)?;
+            }
         }
         idx /= 2;
         level_len = (level_len + 1) / 2;
     }
     // More siblings than the shape allows (a deeper tree with leaves outside the population) is rejected.
     require!(next_sibling == siblings.len(), TorusError::ProofShapeMismatch);
-    Ok((root_commitment(&cur_hash, cur_sum, population_size), cur_sum))
+    Ok(FoldedProof {
+        commitment: root_commitment(&cur_hash, cur_sum, population_size),
+        root_sum: cur_sum,
+        lower,
+    })
 }
 
 /// Parent of a node and its sibling.

@@ -97,7 +97,7 @@ pub struct RequestWithdrawal<'info> {
         bump = token_state.bump,
         has_one = issuer @ TorusError::Unauthorized,
     )]
-    pub token_state: Account<'info, TokenState>,
+    pub token_state: Box<Account<'info, TokenState>>,
 
     #[account(
         seeds = [MANIFEST_SEED, token_state.mint.as_ref()],

@@ -1,0 +1,16 @@
+[package]
+name = "torus-venue"
+version = "0.1.0"
+description = "Settle fills of Torus tokens from a venue program: straight from the seller to the buyer, through the Torus transfer hook (CPI)"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+solana-program = "2.3.0"
+spl-token-2022 = { version = "6.0.0", features = ["no-entrypoint"] }
+
+[dev-dependencies]
+spl-pod = "0.5.1"

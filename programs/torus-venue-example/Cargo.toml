@@ -1,0 +1,22 @@
+[package]
+name = "torus-venue-example"
+version = "0.1.0"
+description = "An example venue program that settles Torus fills through the torus-venue crate"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "torus_venue_example"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.2", features = ["init-if-needed"] }
+torus-venue = { path = "../../crates/torus-venue" }

@@ -55,6 +55,15 @@ pub fn check_perk_params(p: &PerkParams) -> Result<()> {
     check_share_bps(p.restamp_fee_bps)
 }
 
+/// Value of `tokens` (base units of the brand token) in the pool's currency, at a rate given as the totals of a
+/// conversion: `usdc` paid for `per_tokens`. Rounded down.
+pub fn value_at(tokens: u64, rate: (u64, u64)) -> Result<u64> {
+    let (usdc, per_tokens) = rate;
+    require!(per_tokens > 0, TorusError::IssuerTermsNotSet);
+    let value = (tokens as u128) * (usdc as u128) / (per_tokens as u128);
+    u64::try_from(value).map_err(|_| error!(TorusError::MathOverflow))
+}
+
 /// Splits the operator's share of a conversion into (local partner, Torus treasury). A revoked partner gets nothing.
 pub fn split_operator_share(to_operator: u64, partner_bps: u16, partner_active: bool) -> Result<(u64, u64)> {
     let to_partner = if partner_active { mul_bps(to_operator, partner_bps)? } else { 0 };
@@ -140,6 +149,8 @@ pub fn judge(f: &Findings) -> AuditResult {
     let met = met && !matches!(f.tax, TaxVerdict::Capped(_));
     if f.overstatement {
         AuditResult::FraudOverstatement
+    } else if met && f.obligation == 0 { // all of it was excused (excuses.rs): nothing to pass or fall short of
+        AuditResult::Excused
     } else if f.recognized < f.floor {
         AuditResult::Underdelivered
     } else if met {
@@ -152,6 +163,19 @@ pub fn judge(f: &Findings) -> AuditResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_is_valued_at_the_rate_fees_were_converted_at() {
+        // 10_000 fee tokens sold for 5_000_000: a 2_000-token obligation is worth 1_000_000.
+        assert_eq!(value_at(2_000, (5_000_000, 10_000)).unwrap(), 1_000_000);
+        // At one USDC per token nothing changes.
+        assert_eq!(value_at(1_234_567, (1_000_000, 1_000_000)).unwrap(), 1_234_567);
+        // A cheap token: 1_000_000 tokens at 0.1 USDC each.
+        assert_eq!(value_at(1_000_000, (100_000, 1_000_000)).unwrap(), 100_000);
+        assert_eq!(value_at(3, (1, 2)).unwrap(), 1, "rounded down");
+        assert!(value_at(1, (1, 0)).is_err(), "no rate, no value");
+        assert!(value_at(u64::MAX, (u64::MAX, 1)).is_err(), "overflow is an error, not a wrap");
+    }
 
     fn params() -> PerkParams {
         PerkParams {
